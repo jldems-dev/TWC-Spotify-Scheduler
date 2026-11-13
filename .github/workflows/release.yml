@@ -1,4 +1,4 @@
-
+@ -1,75 +1,103 @@
 name: Publish Windows release
 
 on:
@@ -17,7 +17,6 @@ jobs:
   windows-release:
     name: Build and publish Windows NSIS release
     runs-on: windows-latest
-
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -28,7 +27,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          # npm cache temporarily disabled
+          cache: npm
+          cache-dependency-path: source/package-lock.json
 
       - name: Validate tag and reject duplicate release
         shell: pwsh
@@ -41,7 +41,6 @@ jobs:
         run: |
           $packageVersion = node -p "require('./package.json').version"
           if ($LASTEXITCODE -ne 0) { throw 'Could not read package.json version.' }
-
           $expectedTag = "v$packageVersion"
           if ($env:RELEASE_TAG -cne $expectedTag) {
             throw "Tag '$env:RELEASE_TAG' does not match package.json version '$packageVersion' (expected '$expectedTag')."
@@ -53,7 +52,6 @@ jobs:
             Accept = 'application/vnd.github+json'
             'X-GitHub-Api-Version' = '2022-11-28'
           }
-
           $releaseExists = $false
           try {
             $null = Invoke-RestMethod -Uri $releaseUri -Headers $headers -Method Get
@@ -62,28 +60,18 @@ jobs:
             $statusCode = $_.Exception.Response.StatusCode
             if ($null -eq $statusCode -or [int]$statusCode -ne 404) { throw }
           }
-
           if ($releaseExists) {
             throw "A GitHub Release already exists for '$env:RELEASE_TAG'; refusing to overwrite it."
           }
-
           Write-Host "Validated tag $env:RELEASE_TAG for package version $packageVersion; no release exists yet."
 
-      - name: Configure npm
-        working-directory: source
-        run: |
-          npm config set registry https://registry.npmjs.org/
-          npm config set fetch-retries 5
-          npm config set fetch-retry-mintimeout 20000
-          npm config set fetch-retry-maxtimeout 120000
-
       - name: Install locked dependencies
+        run: npm ci
         working-directory: source
-        run: npm ci --prefer-online --no-audit --no-fund
 
       - name: Build and publish Windows installer
-        working-directory: source
         run: npm run release:win
+        working-directory: source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -97,32 +85,20 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           $releaseUri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases/tags/$([uri]::EscapeDataString($env:RELEASE_TAG))"
-          $headers = @{
-            Authorization = "Bearer $env:GITHUB_TOKEN"
-            Accept = 'application/vnd.github+json'
-            'X-GitHub-Api-Version' = '2022-11-28'
-          }
-
+          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
           $deadline = (Get-Date).AddMinutes(2)
-
           do {
             try {
               $release = Invoke-RestMethod -Uri $releaseUri -Headers $headers -Method Get
               $assets = @($release.assets | ForEach-Object { $_.name })
-
               $hasLatest = $assets -contains 'latest.yml'
               $hasInstaller = @($assets | Where-Object { $_ -match '\.exe$' }).Count -gt 0
               $hasBlockmap = @($assets | Where-Object { $_ -match '\.blockmap$' }).Count -gt 0
-
               if ($hasLatest -and $hasInstaller -and $hasBlockmap) {
                 Write-Host "Verified updater metadata, installer, and blockmap for $env:RELEASE_TAG."
                 exit 0
               }
-            } catch {
-              Write-Host "Waiting for release assets: $($_.Exception.Message)"
-            }
-
+            } catch { Write-Host "Waiting for release assets: $($_.Exception.Message)" }
             Start-Sleep -Seconds 5
           } while ((Get-Date) -lt $deadline)
-
           throw "Release $env:RELEASE_TAG is missing latest.yml, installer EXE, or blockmap."

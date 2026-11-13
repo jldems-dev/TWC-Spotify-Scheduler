@@ -15,4 +15,6 @@ git push origin v1.0.2
 
 
 
-npx electron-builder --win nsis                        
+npx electron-builder --win nsis     
+
+npm run build && electron-builder --win nsis --publish always
