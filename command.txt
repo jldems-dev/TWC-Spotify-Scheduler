@@ -1,5 +1,5 @@
 git add .github/workflows/release.yml
-git commit -m "Fix Windows GitHub Actions checkout path"
+git commit -m "Fix release"
 git push origin main
 
 
