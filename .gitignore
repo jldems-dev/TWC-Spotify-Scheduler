@@ -1,0 +1,31 @@
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-electron/
+release/
+
+# Build caches
+.electron-builder-cache/
+.electron-smoke/
+*.tsbuildinfo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local application data
+*.db
+*.sqlite
+*.sqlite3
