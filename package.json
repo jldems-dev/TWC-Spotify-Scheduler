@@ -15,6 +15,7 @@
     "release:win": "npm run build && electron-builder --win nsis --publish always"
   },
   "dependencies": {
+    "electron-updater": "6.8.11",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
@@ -24,21 +25,46 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
     "electron": "^33.2.1",
     "electron-builder": "^25.1.8",
     "typescript": "~5.7.2",
     "vite": "^6.0.5",
-    "concurrently": "^9.1.0",
     "wait-on": "^8.0.1"
   },
   "build": {
     "appId": "com.twcstafford.musicscheduler",
     "productName": "TWC Stafford Music Scheduler",
-    "directories": { "output": "release" },
-    "extraResources": [{ "from": "assets/icons/app-icon-release.ico", "to": "app-icon.ico" }],
-    "files": ["dist/**/*", "dist-electron/**/*", "package.json"],
-    "win": { "target": "nsis", "icon": "assets/icons/app-icon-release.ico", "artifactName": "TWC-Stafford-Music-Scheduler-Setup-${version}.${ext}" },
-    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "installerIcon": "assets/icons/app-icon-release.ico", "uninstallerIcon": "assets/icons/app-icon-release.ico" },
-    "publish": [{ "provider": "github", "releaseType": "release" }]
+    "directories": {
+      "output": "release"
+    },
+    "extraResources": [
+      {
+        "from": "assets/icons/app-icon-release.ico",
+        "to": "app-icon.ico"
+      }
+    ],
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icons/app-icon-release.ico",
+      "artifactName": "TWC-Stafford-Music-Scheduler-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "assets/icons/app-icon-release.ico",
+      "uninstallerIcon": "assets/icons/app-icon-release.ico"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "releaseType": "release"
+      }
+    ]
   }
 }
