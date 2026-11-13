@@ -10,6 +10,7 @@ import {
   session,
   type MenuItemConstructorOptions,
 } from "electron";
+import { autoUpdater } from "electron-updater";
 import path from "node:path";
 import fs from "node:fs/promises";
 import http from "node:http";
@@ -520,6 +521,51 @@ async function spotifyStatus() {
 let win: BrowserWindow;
 let scheduleCoordinator: ScheduleCoordinator | undefined;
 let shutdownLogging = false;
+type UpdateStatus = { status: "unsupported" | "idle" | "checking" | "current" | "available" | "downloading" | "downloaded" | "error"; currentVersion: string; version?: string; percent?: number; message: string };
+let updaterStatus: UpdateStatus = { status: "idle", currentVersion: app.getVersion(), message: "Updates have not been checked yet." };
+let updaterCheckPromise: Promise<void> | null = null;
+function publishUpdaterStatus(next: UpdateStatus, log?: { level: "info" | "warn" | "error"; message: string }) {
+  updaterStatus = { ...next, currentVersion: app.getVersion() };
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send("updater:status", updaterStatus);
+  }
+  if (log) void addLog(log.level, `[updater] ${log.message}`).catch((error) => startupLog(`[updater] Could not write updater log: ${String(error)}`));
+}
+function initializeUpdater() {
+  if (!app.isPackaged) {
+    publishUpdaterStatus({ status: "unsupported", currentVersion: app.getVersion(), message: "Updates are available in installed builds only." });
+    return;
+  }
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = false;
+  autoUpdater.allowPrerelease = false;
+  autoUpdater.on("checking-for-update", () => publishUpdaterStatus({ status: "checking", currentVersion: app.getVersion(), message: "Checking GitHub Releases for updates…" }, { level: "info", message: "Checking GitHub Releases." }));
+  autoUpdater.on("update-available", (info) => publishUpdaterStatus({ status: "available", currentVersion: app.getVersion(), version: info.version, percent: 0, message: `Version ${info.version} is available. Downloading in the background…` }, { level: "info", message: `Version ${info.version} is available; background download started.` }));
+  autoUpdater.on("update-not-available", (info) => publishUpdaterStatus({ status: "current", currentVersion: app.getVersion(), version: info.version, message: `You are up to date. Installed version: ${app.getVersion()}.` }, { level: "info", message: `No newer release found (latest: ${info.version}).` }));
+  autoUpdater.on("download-progress", (progress) => {
+    const percent = Math.max(0, Math.min(100, Math.round(progress.percent)));
+    publishUpdaterStatus({ status: "downloading", currentVersion: app.getVersion(), version: updaterStatus.version, percent, message: `Downloading update${updaterStatus.version ? ` ${updaterStatus.version}` : ""}… ${percent}%` });
+    if (percent === 0 || percent === 100 || percent % 10 === 0) void addLog("info", `[updater] Download progress: ${percent}%.`).catch(() => undefined);
+  });
+  autoUpdater.on("update-downloaded", (info) => publishUpdaterStatus({ status: "downloaded", currentVersion: app.getVersion(), version: info.version, percent: 100, message: `Version ${info.version} is downloaded and ready to install.` }, { level: "info", message: `Version ${info.version} downloaded and ready to install.` }));
+  autoUpdater.on("error", (error) => {
+    const message = redactSecrets(error?.message || String(error)).slice(0, 500);
+    publishUpdaterStatus({ status: "error", currentVersion: app.getVersion(), version: updaterStatus.version, message: `Update check failed: ${message}` }, { level: "error", message: `Update check or download failed: ${message}` });
+  });
+}
+async function checkForUpdates() {
+  if (!app.isPackaged) return updaterStatus;
+  if (updaterStatus.status === "downloading" || updaterStatus.status === "downloaded") return updaterStatus;
+  if (updaterCheckPromise) { await updaterCheckPromise; return updaterStatus; }
+  updaterCheckPromise = autoUpdater.checkForUpdates().then(() => undefined).catch((error: any) => {
+    if (updaterStatus.status !== "error") {
+      const message = redactSecrets(error?.message || String(error)).slice(0, 500);
+      publishUpdaterStatus({ status: "error", currentVersion: app.getVersion(), message: `Update check failed: ${message}` }, { level: "error", message: `Update check failed: ${message}` });
+    }
+  }).finally(() => { updaterCheckPromise = null; });
+  await updaterCheckPromise;
+  return updaterStatus;
+}
 const hasSingleInstance = app.requestSingleInstanceLock();
 if (!hasSingleInstance) app.quit();
 app.on("second-instance", () => {
@@ -683,6 +729,7 @@ app
       `Electron ready; packaged=${app.isPackaged}; appPath=${app.getAppPath()}; localTimeZone=${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
     );
     createWindow();
+    initializeUpdater();
     void updateWindowTitle().catch(() => undefined);
     app.on("activate", () => {
       if (!BrowserWindow.getAllWindows().length) createWindow();
@@ -714,6 +761,7 @@ app
       "info",
       `Application started; local time zone ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`,
     ).catch((error) => startupLog(`Could not write startup activity log: ${String(error)}`));
+    if (app.isPackaged) setTimeout(() => { void checkForUpdates(); }, 2500);
   })
   .catch((error) => startupLog(`Electron startup failed: ${String(error)}`));
 app.on("before-quit", (event) => {
@@ -805,6 +853,23 @@ ipcMain.handle("branding:reset", async (event) => {
   });
   await updateWindowTitle();
   return brandingData();
+});
+ipcMain.handle("updater:status", (event) => {
+  assertTrustedSender(event);
+  return { ...updaterStatus, currentVersion: app.getVersion() };
+});
+ipcMain.handle("updater:check", async (event) => {
+  assertTrustedSender(event);
+  return checkForUpdates();
+});
+ipcMain.handle("updater:install", async (event) => {
+  assertTrustedSender(event);
+  if (!app.isPackaged || updaterStatus.status !== "downloaded") return false;
+  const response = await dialog.showMessageBox(win, { type: "info", title: "Install application update", message: `Version ${updaterStatus.version || "new"} is ready to install.`, detail: "The application will close and restart to finish installing the update.", buttons: ["Restart and Install", "Later"], defaultId: 0, cancelId: 1, noLink: true });
+  if (response.response !== 0) return false;
+  void addLog("info", `[updater] User confirmed restart and installation of version ${updaterStatus.version || "new"}.`).catch(() => undefined);
+  autoUpdater.quitAndInstall(false, true);
+  return true;
 });
 ipcMain.handle("data:save", async (_e, input) => {
   assertTrustedSender(_e);

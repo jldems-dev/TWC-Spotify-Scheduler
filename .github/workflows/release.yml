@@ -73,3 +73,31 @@ jobs:
         working-directory: source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify updater release assets
+        shell: pwsh
+        working-directory: source
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          $releaseUri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases/tags/$([uri]::EscapeDataString($env:RELEASE_TAG))"
+          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          $deadline = (Get-Date).AddMinutes(2)
+          do {
+            try {
+              $release = Invoke-RestMethod -Uri $releaseUri -Headers $headers -Method Get
+              $assets = @($release.assets | ForEach-Object { $_.name })
+              $hasLatest = $assets -contains 'latest.yml'
+              $hasInstaller = @($assets | Where-Object { $_ -match '\.exe$' }).Count -gt 0
+              $hasBlockmap = @($assets | Where-Object { $_ -match '\.blockmap$' }).Count -gt 0
+              if ($hasLatest -and $hasInstaller -and $hasBlockmap) {
+                Write-Host "Verified updater metadata, installer, and blockmap for $env:RELEASE_TAG."
+                exit 0
+              }
+            } catch { Write-Host "Waiting for release assets: $($_.Exception.Message)" }
+            Start-Sleep -Seconds 5
+          } while ((Get-Date) -lt $deadline)
+          throw "Release $env:RELEASE_TAG is missing latest.yml, installer EXE, or blockmap."

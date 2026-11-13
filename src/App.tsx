@@ -126,6 +126,7 @@ export default function App() {
   const [page, setPage] = useState<Page>("Home"),
     [data, setData] = useState<any>(seed),
     [branding, setBranding] = useState<any>({ pharmacyName: "TWC Stafford", pharmacyLogo: "", pharmacyIcon: "", version: "" }),
+    [updateStatus, setUpdateStatus] = useState<any>({ status: "idle", currentVersion: "…", message: "Loading update status…" }),
     [spotify, setSpotify] = useState<any>({
       connected: false,
       message: "Checking...",
@@ -847,6 +848,15 @@ export default function App() {
     };
   }, []);
   useEffect(() => window.twc.onSpotifyPlaybackStage(setPlaybackStage), []);
+  useEffect(() => {
+    const unsubscribe = window.twc.onUpdaterStatus(setUpdateStatus);
+    void window.twc.updaterStatus().then(setUpdateStatus).catch(() => undefined);
+    return unsubscribe;
+  }, []);
+  useEffect(() => {
+    if (["checking", "current", "available", "downloaded", "error"].includes(updateStatus.status)) notify(updateStatus.message);
+    else if (updateStatus.status === "downloading" && updateStatus.percent > 0 && updateStatus.percent % 10 === 0) notify(updateStatus.message);
+  }, [updateStatus.status, updateStatus.percent]);
   useEffect(() => {
     let active = true;
     const refreshDeviceInfo = () => {
@@ -3233,6 +3243,16 @@ export default function App() {
                 title="Settings"
                 sub="Application preferences and connected services."
               />
+              <div className="panel form-panel updater-panel">
+                <h3>Application Updates</h3>
+                <div className="setting-readonly"><b>Installed version</b><span>{updateStatus.currentVersion || branding.version || "…"}</span></div>
+                <p className={`updater-message updater-${updateStatus.status}`}>{updateStatus.message}</p>
+                {updateStatus.status === "downloading" && <div className="update-progress" role="progressbar" aria-label="Update download progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={updateStatus.percent || 0}><span style={{ width: `${updateStatus.percent || 0}%` }} /></div>}
+                <div className="form-inline">
+                  <button className="primary" disabled={["unsupported", "checking", "available", "downloading", "downloaded"].includes(updateStatus.status)} onClick={() => { void window.twc.updaterCheck().then(setUpdateStatus).catch((error) => notify(String(error).replace(/^Error: /, ""))); }}>{updateStatus.status === "checking" ? "Checking…" : "Check for Updates"}</button>
+                  {updateStatus.status === "downloaded" && <button className="primary" onClick={() => void window.twc.updaterInstall().catch((error) => notify(String(error).replace(/^Error: /, "")))}>Restart and Install Update{updateStatus.version ? ` ${updateStatus.version}` : ""}</button>}
+                </div>
+              </div>
               <div className="panel form-panel branding-panel">
                 <h3>Application Branding</h3>
                 <p>Personalize the name and images shown in this installation.</p>

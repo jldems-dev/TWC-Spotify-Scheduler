@@ -14,6 +14,14 @@ contextBridge.exposeInMainWorld('twc', {
   brandingUpload: (kind: 'logo'|'icon') => ipcRenderer.invoke('branding:upload', kind),
   brandingStoreIcon: (variants: unknown) => ipcRenderer.invoke('branding:store-icon', variants),
   brandingReset: () => ipcRenderer.invoke('branding:reset'),
+  updaterStatus: () => ipcRenderer.invoke('updater:status'),
+  updaterCheck: () => ipcRenderer.invoke('updater:check'),
+  updaterInstall: () => ipcRenderer.invoke('updater:install'),
+  onUpdaterStatus: (listener: (status: any) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, status: any) => listener(status);
+    ipcRenderer.on('updater:status', handler);
+    return () => ipcRenderer.removeListener('updater:status', handler);
+  },
   onSpotifyPlaybackStage: (listener: (stage: string) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, data: { stage: string }) => listener(data.stage);
     ipcRenderer.on('spotify:playback-stage', handler);
