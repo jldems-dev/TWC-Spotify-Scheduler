@@ -70,6 +70,9 @@ const empty: Store = {
     googleClientId: "",
     defaultPlaylist: "",
     schedulerEnabled: true,
+    pharmacyName: "TWC Stafford",
+    pharmacyLogo: "",
+    pharmacyIcon: "",
   },
   schedules: [],
   exceptions: [],
@@ -82,6 +85,42 @@ const empty: Store = {
 };
 const dataFile = () =>
   path.join(app.getPath("userData"), "scheduler-data.json");
+const brandingDir = () => path.join(app.getPath("userData"), "branding");
+const brandingDefaults = { pharmacyName: "TWC Stafford", pharmacyLogo: "", pharmacyIcon: "" };
+const brandingFile = (name: string) => {
+  if (!name || path.basename(name) !== name || !/^[a-f0-9-]+\.(png|jpe?g|webp)$/i.test(name)) return null;
+  return path.join(brandingDir(), name);
+};
+async function brandingData() {
+  const { settings } = await readStore();
+  const result: any = { ...brandingDefaults, version: app.getVersion() };
+  result.pharmacyName = typeof settings.pharmacyName === "string" && settings.pharmacyName.trim() ? settings.pharmacyName : brandingDefaults.pharmacyName;
+  for (const key of ["pharmacyLogo", "pharmacyIcon"] as const) {
+    const file = brandingFile(String(settings[key] || ""));
+    if (file) {
+      try {
+        const bytes = await fs.readFile(file);
+        const ext = path.extname(file).slice(1).toLowerCase().replace("jpg", "jpeg");
+        result[key] = path.basename(file);
+        result[`${key}Preview`] = `data:image/${ext};base64,${bytes.toString("base64")}`;
+        if (key === "pharmacyIcon") {
+          const base = path.basename(file).replace(/-256\.png$/i, "");
+          result.pharmacyIconSizes = {};
+          for (const size of [128, 64, 32]) {
+            try { result.pharmacyIconSizes[size] = `data:image/png;base64,${(await fs.readFile(path.join(brandingDir(), `${base}-${size}.png`))).toString("base64")}`; }
+            catch { result.pharmacyIconSizes[size] = result[`${key}Preview`]; }
+          }
+        }
+      } catch { result[key] = ""; result[`${key}Preview`] = ""; }
+    } else { result[key] = ""; result[`${key}Preview`] = ""; }
+  }
+  return result;
+}
+async function updateWindowTitle() {
+  const brand = await brandingData();
+  const title = `${brand.pharmacyName} Music Scheduler`;
+  for (const window of BrowserWindow.getAllWindows()) window.setTitle(title);
+}
 const tokenFile = () => path.join(app.getPath("userData"), "spotify-token.bin");
 const googleTokenFile = () => path.join(app.getPath("userData"), "google-business-token.bin");
 const googleClientCredentialFile = () => path.join(app.getPath("userData"), "google-desktop-client.bin");
@@ -259,6 +298,9 @@ async function readStore(): Promise<Store> {
       ...(Number.isInteger(sourceSettings.googleSyncMinutes) ? { googleSyncMinutes: sourceSettings.googleSyncMinutes } : {}),
       defaultPlaylist: sourceSettings.defaultPlaylist ?? empty.settings.defaultPlaylist,
       ...(sourceSettings.timezone !== undefined ? { timezone: sourceSettings.timezone } : {}),
+      pharmacyName: typeof sourceSettings.pharmacyName === "string" ? sourceSettings.pharmacyName : "TWC Stafford",
+      pharmacyLogo: typeof sourceSettings.pharmacyLogo === "string" ? sourceSettings.pharmacyLogo : "",
+      pharmacyIcon: typeof sourceSettings.pharmacyIcon === "string" ? sourceSettings.pharmacyIcon : "",
     },
     schedules: sourceSchedules.map(({ id, name, days, dates, date, repeat, googleSourceId, start, end, playlistId, playlistName, enabled, quiet }: any) =>
       ({ id, name, days, ...(dates ? { dates } : {}), ...(date ? { date } : {}), ...(repeat ? { repeat } : {}), ...(googleSourceId ? { googleSourceId } : {}), start, end, ...(playlistId !== undefined ? { playlistId } : {}), ...(playlistName !== undefined ? { playlistName } : {}), enabled, quiet })),
@@ -641,6 +683,7 @@ app
       `Electron ready; packaged=${app.isPackaged}; appPath=${app.getAppPath()}; localTimeZone=${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
     );
     createWindow();
+    void updateWindowTitle().catch(() => undefined);
     app.on("activate", () => {
       if (!BrowserWindow.getAllWindows().length) createWindow();
     });
@@ -701,6 +744,67 @@ app.on("window-all-closed", () => {
 ipcMain.handle("data:load", (event) => {
   assertTrustedSender(event);
   return readStore();
+});
+ipcMain.handle("branding:load", async (event) => {
+  assertTrustedSender(event);
+  return brandingData();
+});
+ipcMain.handle("branding:save", async (event, input) => {
+  assertTrustedSender(event);
+  if (!isRecord(input) || typeof input.pharmacyName !== "string" || input.pharmacyName.trim().length < 1 || input.pharmacyName.trim().length > 100 || typeof input.pharmacyLogo !== "string" || typeof input.pharmacyIcon !== "string") throw new Error("Enter a pharmacy name up to 100 characters.");
+  for (const name of [input.pharmacyLogo, input.pharmacyIcon]) if (name && !brandingFile(name)) throw new Error("Invalid branding image reference.");
+  await withStoreMutation(async () => {
+    const store = await readStore();
+    store.settings = { ...store.settings, pharmacyName: input.pharmacyName.trim(), pharmacyLogo: input.pharmacyLogo, pharmacyIcon: input.pharmacyIcon };
+    await writeStore(store);
+  });
+  await updateWindowTitle();
+  return brandingData();
+});
+ipcMain.handle("branding:upload", async (event, kind: string) => {
+  assertTrustedSender(event);
+  if (kind !== "logo" && kind !== "icon") throw new Error("Invalid branding image type.");
+  const selected = await dialog.showOpenDialog(win, { title: kind === "logo" ? "Choose pharmacy logo" : "Choose application icon", properties: ["openFile"], filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp"] }] });
+  if (selected.canceled || !selected.filePaths[0]) return null;
+  const source = selected.filePaths[0];
+  const stat = await fs.stat(source);
+  if (!stat.isFile() || stat.size > 5 * 1024 * 1024) throw new Error("Choose an image smaller than 5 MB.");
+  const bytes = await fs.readFile(source);
+  const ext = path.extname(source).slice(1).toLowerCase();
+  const png = bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]));
+  const jpeg = bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
+  const webp = bytes.length >= 12 && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP";
+  if (!((ext === "png" && png) || ((ext === "jpg" || ext === "jpeg") && jpeg) || (ext === "webp" && webp))) throw new Error("The selected file is not a supported PNG, JPG, or WebP image.");
+  if (kind === "icon") return { sourceDataUrl: `data:image/${ext === "jpg" ? "jpeg" : ext};base64,${bytes.toString("base64")}` };
+  await fs.mkdir(brandingDir(), { recursive: true });
+  const name = `${crypto.randomUUID()}.${ext}`;
+  await fs.copyFile(source, path.join(brandingDir(), name), 0);
+  return { name, dataUrl: `data:image/${ext === "jpg" ? "jpeg" : ext};base64,${bytes.toString("base64")}` };
+});
+ipcMain.handle("branding:store-icon", async (event, variants) => {
+  assertTrustedSender(event);
+  const sizes = [256, 128, 64, 32];
+  if (!isRecord(variants) || sizes.some((size) => typeof variants[size] !== "string" || variants[size].length > 2 * 1024 * 1024)) throw new Error("Could not process the application icon.");
+  const base = crypto.randomUUID();
+  await fs.mkdir(brandingDir(), { recursive: true });
+  for (const size of sizes) {
+    const encoded = variants[size] as string;
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) throw new Error("Invalid processed icon image.");
+    const bytes = Buffer.from(encoded, "base64");
+    if (bytes.length < 24 || !bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) || bytes.readUInt32BE(16) !== size || bytes.readUInt32BE(20) !== size) throw new Error("Processed icon must be a square PNG at each required size.");
+    await fs.writeFile(path.join(brandingDir(), `${base}-${size}.png`), bytes, { flag: "wx", mode: 0o600 });
+  }
+  return { name: `${base}-256.png`, previews: Object.fromEntries(sizes.map((size) => [size, `data:image/png;base64,${variants[size]}`])) };
+});
+ipcMain.handle("branding:reset", async (event) => {
+  assertTrustedSender(event);
+  await withStoreMutation(async () => {
+    const store = await readStore();
+    store.settings = { ...store.settings, ...brandingDefaults };
+    await writeStore(store);
+  });
+  await updateWindowTitle();
+  return brandingData();
 });
 ipcMain.handle("data:save", async (_e, input) => {
   assertTrustedSender(_e);
@@ -843,7 +947,7 @@ ipcMain.handle("data:save", async (_e, input) => {
       !validImage
     ) throw new Error("Invalid Spotify playlist data.");
   }
-  const settingKeys = new Set(["schedulerEnabled", "spotifyClientId", "googleClientId", "googleLocation", "googleLocationTitle", "googleLastSync", "googleSyncMinutes", "defaultPlaylist", "timezone"]);
+  const settingKeys = new Set(["schedulerEnabled", "spotifyClientId", "googleClientId", "googleLocation", "googleLocationTitle", "googleLastSync", "googleSyncMinutes", "defaultPlaylist", "timezone", "pharmacyName", "pharmacyLogo", "pharmacyIcon"]);
   if (
     Object.keys(input.settings).some((key) => !settingKeys.has(key)) ||
     typeof input.settings.schedulerEnabled !== "boolean" ||
@@ -869,6 +973,9 @@ ipcMain.handle("data:save", async (_e, input) => {
         ...(Number.isInteger(input.settings.googleSyncMinutes) ? { googleSyncMinutes: input.settings.googleSyncMinutes } : {}),
         defaultPlaylist: input.settings.defaultPlaylist,
         ...(input.settings.timezone !== undefined ? { timezone: input.settings.timezone } : {}),
+        pharmacyName: current.settings.pharmacyName || "TWC Stafford",
+        pharmacyLogo: current.settings.pharmacyLogo || "",
+        pharmacyIcon: current.settings.pharmacyIcon || "",
       },
       schedules: input.schedules.map(({ id, name, days, dates, date, repeat, googleSourceId, start, end, playlistId, playlistName, enabled, quiet }: any) =>
         ({ id, name, days, ...(dates ? { dates } : {}), ...(date ? { date } : {}), ...(repeat ? { repeat } : {}), ...(googleSourceId ? { googleSourceId } : {}), start, end, ...(playlistId !== undefined ? { playlistId } : {}), ...(playlistName !== undefined ? { playlistName } : {}), enabled, quiet })),

@@ -125,6 +125,7 @@ const nav: { name: Page; icon: any }[] = [
 export default function App() {
   const [page, setPage] = useState<Page>("Home"),
     [data, setData] = useState<any>(seed),
+    [branding, setBranding] = useState<any>({ pharmacyName: "TWC Stafford", pharmacyLogo: "", pharmacyIcon: "", version: "" }),
     [spotify, setSpotify] = useState<any>({
       connected: false,
       message: "Checking...",
@@ -813,6 +814,7 @@ export default function App() {
         }),
       )
       .catch((e) => notify(String(e)));
+    window.twc.brandingLoad().then(setBranding).catch(() => undefined);
     window.twc
       .spotifyStatus()
       .then(setSpotify)
@@ -1314,6 +1316,40 @@ export default function App() {
   function updateSetting(key: string, value: any) {
     persist({ ...data, settings: { ...data.settings, [key]: value } });
   }
+  async function uploadBrandAsset(kind: "logo" | "icon") {
+    try {
+      const picked = await window.twc.brandingUpload(kind);
+      if (!picked) return;
+      if (kind === "logo" && picked.name && picked.dataUrl) {
+        setBranding((current: any) => ({ ...current, pharmacyLogo: picked.name, pharmacyLogoPreview: picked.dataUrl }));
+        return;
+      }
+      if (kind === "icon" && picked.sourceDataUrl) {
+        const image = new Image();
+        image.src = picked.sourceDataUrl;
+        await image.decode();
+        if (image.naturalWidth > 12000 || image.naturalHeight > 12000 || image.naturalWidth * image.naturalHeight > 40000000) throw new Error("This image is too large to process safely. Choose an image under 40 megapixels.");
+        const variants: Record<number, string> = {};
+        for (const size of [256, 128, 64, 32]) {
+          const canvas = document.createElement("canvas");
+          canvas.width = size;
+          canvas.height = size;
+          const context = canvas.getContext("2d");
+          if (!context) throw new Error("Icon image processing is unavailable.");
+          context.clearRect(0, 0, size, size);
+          context.imageSmoothingEnabled = true;
+          context.imageSmoothingQuality = "high";
+          const scale = Math.min(size / image.naturalWidth, size / image.naturalHeight);
+          const width = image.naturalWidth * scale;
+          const height = image.naturalHeight * scale;
+          context.drawImage(image, (size - width) / 2, (size - height) / 2, width, height);
+          variants[size] = canvas.toDataURL("image/png").split(",")[1];
+        }
+        const saved = await window.twc.brandingStoreIcon(variants);
+        setBranding((current: any) => ({ ...current, pharmacyIcon: saved.name, pharmacyIconPreview: saved.previews[256], pharmacyIconSizes: { 128: saved.previews[128], 64: saved.previews[64], 32: saved.previews[32] } }));
+      }
+    } catch (error) { notify(String(error).replace(/^Error: /, "")); }
+  }
   function saveSchedule(s: Schedule) {
     const arr = [...data.schedules];
     const i = arr.findIndex((x: Schedule) => x.id === s.id);
@@ -1379,12 +1415,12 @@ export default function App() {
         </button>
 
         <img
-          src="./icons/app-icon.ico"
-          alt="TWC Stafford Music Scheduler"
+          alt={`${branding.pharmacyName} application icon`}
           className="app-title-icon"
+          src={branding.pharmacyIconSizes?.[32] || branding.pharmacyIconPreview || "./icons/app-icon.ico"}
         />
 
-        <span className="title-text">TWC Stafford Music Scheduler</span>
+        <span className="title-text">{branding.pharmacyName} Music Scheduler</span>
 
         <div className="window-controls">
           <button
@@ -1418,7 +1454,7 @@ export default function App() {
       )}
       <aside className={`sidebar ${drawerOpen ? "drawer-open" : ""}`}>
         <div className="brand">
-          <BrandAsset variant="logo" />
+          {branding.pharmacyLogoPreview ? <img className="brand-image" src={branding.pharmacyLogoPreview} alt={`${branding.pharmacyName} logo`} /> : <BrandAsset variant="logo" />}
         </div>
         <nav>
           {nav.map(({ name, icon: Icon }) => (
@@ -1451,7 +1487,8 @@ export default function App() {
               <section className="welcome">
                 <div>
                   <div className="eyebrow">Welcome to</div>
-                  <h1>TWC Stafford</h1>
+                  {branding.pharmacyLogoPreview && <img className="welcome-brand-image" src={branding.pharmacyLogoPreview} alt={`${branding.pharmacyName} logo`} />}
+                  <h1>{branding.pharmacyName}</h1>
                   <p>Music scheduler</p>
                 </div>
                 <button
@@ -3196,6 +3233,17 @@ export default function App() {
                 title="Settings"
                 sub="Application preferences and connected services."
               />
+              <div className="panel form-panel branding-panel">
+                <h3>Application Branding</h3>
+                <p>Personalize the name and images shown in this installation.</p>
+                <label>Pharmacy Name<input maxLength={100} value={branding.pharmacyName} onChange={(e) => setBranding((current: any) => ({ ...current, pharmacyName: e.target.value }))} /></label>
+                <div className="branding-upload-grid">
+                  <div><b>Pharmacy Logo</b><div className="branding-preview">{branding.pharmacyLogoPreview ? <img src={branding.pharmacyLogoPreview} alt="Pharmacy logo preview" /> : <span>Default TWC logo</span>}</div><button className="subtle" onClick={() => void uploadBrandAsset("logo")}>Choose Logo</button></div>
+                  <div><b>Application Icon</b><div className="branding-preview icon-preview">{branding.pharmacyIconPreview ? <img src={branding.pharmacyIconSizes?.[128] || branding.pharmacyIconPreview} alt="Application icon preview" /> : <span>Default TWC icon</span>}</div><button className="subtle" onClick={() => void uploadBrandAsset("icon")}>Choose Icon</button></div>
+                </div>
+                <small>PNG, JPG, JPEG, or WebP. Maximum file size: 5 MB. The Windows executable icon is set during packaging.</small>
+                <div className="form-inline"><button className="primary" onClick={() => void window.twc.brandingSave(branding).then(setBranding).then(() => notify("Application branding saved.")).catch((e) => notify(String(e).replace(/^Error: /, "")))}>Save Changes</button><button className="subtle" onClick={() => void window.twc.brandingReset().then(setBranding).then(() => notify("Default TWC branding restored.")).catch((e) => notify(String(e)))}>Reset to Default</button></div>
+              </div>
               <div className="panel form-panel">
                 <h3>Spotify</h3>
                 <p>
@@ -3843,13 +3891,13 @@ export default function App() {
           )}
           {page === "About" && (
             <>
-              <PageHeading title="About" sub="TWC Stafford Music Scheduler" />
+              <PageHeading title="About" sub={`${branding.pharmacyName} Music Scheduler`} />
               <div className="panel about">
                 <span className="app-mark">
-                  <img src="./icons/app-icon.ico" alt="HM Logo" />
+                  <img src={branding.pharmacyLogoPreview || branding.pharmacyIconSizes?.[128] || branding.pharmacyIconPreview || "./icons/app-icon.ico"} alt={`${branding.pharmacyName} brand`} />
                 </span>
-                <h2>TWC Stafford</h2>
-                <p>Music Scheduler | Version 1.0.0</p>
+                <h2>{branding.pharmacyName}</h2>
+                <p>Music Scheduler | Version {branding.version || "…"}</p>
                 <p>
                   A local desktop tool for configuring music schedules and quiet
                   hours.
@@ -3883,7 +3931,7 @@ export default function App() {
               </b>
             </div>
             <span className="divider" />
-            <span>TWC Stafford Music Scheduler v1.0</span>
+            <span>{branding.pharmacyName} Music Scheduler v{branding.version || "…"}</span>
             <span className="footer-right">
               <img src="./hm_logo.png" alt="HM Logo" />
             </span>

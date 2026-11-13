@@ -1,0 +1,18 @@
+git add .github/workflows/release.yml
+git commit -m "Fix Windows GitHub Actions checkout path"
+git push origin main
+
+
+Commit and push your changes
+
+git add .
+git commit -m "Release v1.0.1"
+git push origin main
+
+Create a new version tag
+git tag v1.0.1
+git push origin v1.0.1
+
+
+
+npx electron-builder --win nsis                        

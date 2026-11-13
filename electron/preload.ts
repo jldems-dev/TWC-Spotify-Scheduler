@@ -9,6 +9,11 @@ contextBridge.exposeInMainWorld('twc', {
   announcementsImport: () => ipcRenderer.invoke('announcements:import'), announcementsAudio: (id: string) => ipcRenderer.invoke('announcements:audio', id), announcementsDeleteFile: (id: string) => ipcRenderer.invoke('announcements:delete-file', id),
   advertisementsImport: () => ipcRenderer.invoke('advertisements:import'), advertisementsAudio: (id: string) => ipcRenderer.invoke('advertisements:audio', id), advertisementsDeleteFile: (id: string) => ipcRenderer.invoke('advertisements:delete-file', id),
   deviceInfo: () => ipcRenderer.invoke('device:info'),
+  brandingLoad: () => ipcRenderer.invoke('branding:load'),
+  brandingSave: (branding: unknown) => ipcRenderer.invoke('branding:save', branding),
+  brandingUpload: (kind: 'logo'|'icon') => ipcRenderer.invoke('branding:upload', kind),
+  brandingStoreIcon: (variants: unknown) => ipcRenderer.invoke('branding:store-icon', variants),
+  brandingReset: () => ipcRenderer.invoke('branding:reset'),
   onSpotifyPlaybackStage: (listener: (stage: string) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, data: { stage: string }) => listener(data.stage);
     ipcRenderer.on('spotify:playback-stage', handler);
