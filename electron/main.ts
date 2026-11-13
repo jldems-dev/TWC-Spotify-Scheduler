@@ -10,7 +10,7 @@ import {
   session,
   type MenuItemConstructorOptions,
 } from "electron";
-import { autoUpdater } from "electron-updater";
+import { autoUpdater, type ProgressInfo, type UpdateInfo } from "electron-updater";
 import path from "node:path";
 import fs from "node:fs/promises";
 import http from "node:http";
@@ -540,15 +540,15 @@ function initializeUpdater() {
   autoUpdater.autoInstallOnAppQuit = false;
   autoUpdater.allowPrerelease = false;
   autoUpdater.on("checking-for-update", () => publishUpdaterStatus({ status: "checking", currentVersion: app.getVersion(), message: "Checking GitHub Releases for updates…" }, { level: "info", message: "Checking GitHub Releases." }));
-  autoUpdater.on("update-available", (info) => publishUpdaterStatus({ status: "available", currentVersion: app.getVersion(), version: info.version, percent: 0, message: `Version ${info.version} is available. Downloading in the background…` }, { level: "info", message: `Version ${info.version} is available; background download started.` }));
-  autoUpdater.on("update-not-available", (info) => publishUpdaterStatus({ status: "current", currentVersion: app.getVersion(), version: info.version, message: `You are up to date. Installed version: ${app.getVersion()}.` }, { level: "info", message: `No newer release found (latest: ${info.version}).` }));
-  autoUpdater.on("download-progress", (progress) => {
+  autoUpdater.on("update-available", (info: UpdateInfo) => publishUpdaterStatus({ status: "available", currentVersion: app.getVersion(), version: info.version, percent: 0, message: `Version ${info.version} is available. Downloading in the background…` }, { level: "info", message: `Version ${info.version} is available; background download started.` }));
+  autoUpdater.on("update-not-available", (info: UpdateInfo) => publishUpdaterStatus({ status: "current", currentVersion: app.getVersion(), version: info.version, message: `You are up to date. Installed version: ${app.getVersion()}.` }, { level: "info", message: `No newer release found (latest: ${info.version}).` }));
+  autoUpdater.on("download-progress", (progress: ProgressInfo) => {
     const percent = Math.max(0, Math.min(100, Math.round(progress.percent)));
     publishUpdaterStatus({ status: "downloading", currentVersion: app.getVersion(), version: updaterStatus.version, percent, message: `Downloading update${updaterStatus.version ? ` ${updaterStatus.version}` : ""}… ${percent}%` });
     if (percent === 0 || percent === 100 || percent % 10 === 0) void addLog("info", `[updater] Download progress: ${percent}%.`).catch(() => undefined);
   });
-  autoUpdater.on("update-downloaded", (info) => publishUpdaterStatus({ status: "downloaded", currentVersion: app.getVersion(), version: info.version, percent: 100, message: `Version ${info.version} is downloaded and ready to install.` }, { level: "info", message: `Version ${info.version} downloaded and ready to install.` }));
-  autoUpdater.on("error", (error) => {
+  autoUpdater.on("update-downloaded", (info: UpdateInfo) => publishUpdaterStatus({ status: "downloaded", currentVersion: app.getVersion(), version: info.version, percent: 100, message: `Version ${info.version} is downloaded and ready to install.` }, { level: "info", message: `Version ${info.version} downloaded and ready to install.` }));
+  autoUpdater.on("error", (error: Error) => {
     const message = redactSecrets(error?.message || String(error)).slice(0, 500);
     publishUpdaterStatus({ status: "error", currentVersion: app.getVersion(), version: updaterStatus.version, message: `Update check failed: ${message}` }, { level: "error", message: `Update check or download failed: ${message}` });
   });
