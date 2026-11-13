@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f7f9fc" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://i.scdn.co https://mosaic.scdn.co https://image-cdn-ak.spotifycdn.com; media-src 'self' data:; font-src 'self' data:; connect-src 'self' https://api.spotify.com https://accounts.spotify.com; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src 'none'" />
+    <link rel="stylesheet" href="./src/startup.css" />
+    <script type="module" src="./src/startup.js"></script>
+    <title>TWC Stafford Music Scheduler</title>
+</head>
+
+<body>
+    <main id="startup-screen" class="startup-screen" role="status" aria-live="polite">
+        <div class="startup-content">
+            <img class="startup-logo" src="./branding/twc-stafford-logo.png" alt="TWC Stafford" />
+            <div class="startup-spinner" aria-hidden="true"></div>
+            <p class="startup-message">Loading TWC Stafford Music Scheduler...</p>
+            <div class="startup-failure" role="alert" hidden>
+                <h1>The app could not start</h1>
+                <p>Something went wrong while opening TWC Stafford Music Scheduler. Please close and reopen the app. If the problem continues, contact support.</p>
+                <details><summary>Technical details</summary><pre></pre></details>
+            </div>
+        </div>
+    </main>
+    <div id="root"></div>
+    <script type="module" src="./src/main.tsx"></script>
+</body>
+
+</html>

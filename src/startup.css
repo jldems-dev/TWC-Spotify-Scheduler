@@ -1,0 +1,99 @@
+.startup-screen {
+  position: fixed;
+  z-index: 9999;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: #f7f9fc;
+  color: #111f39;
+  font-family: Poppins, "Segoe UI", Arial, sans-serif;
+  text-align: center;
+  transition: opacity 260ms ease, visibility 260ms ease;
+}
+
+.startup-screen.is-ready {
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.startup-content {
+  display: flex;
+  width: min(100%, 540px);
+  align-items: center;
+  flex-direction: column;
+}
+
+.startup-logo {
+  display: block;
+  width: min(360px, 72vw);
+  max-height: 180px;
+  object-fit: contain;
+}
+
+.startup-spinner {
+  width: 36px;
+  height: 36px;
+  margin-top: 34px;
+  border: 3px solid #dce5f2;
+  border-top-color: #1d4f91;
+  border-radius: 50%;
+  animation: startup-spin 850ms linear infinite;
+}
+
+.startup-message {
+  margin: 16px 0 0;
+  color: #52647e;
+  font-size: 15px;
+}
+
+.startup-failure {
+  margin-top: 24px;
+  padding: 20px 24px;
+  border: 1px solid #e4e9f1;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 12px 40px #20365512;
+  text-align: left;
+}
+
+.startup-failure h1 {
+  margin: 0 0 8px;
+  font-size: 20px;
+}
+
+.startup-failure p {
+  margin: 0;
+  color: #52647e;
+  line-height: 1.6;
+}
+
+.startup-failure details {
+  margin-top: 12px;
+  color: #71819a;
+  font-size: 12px;
+}
+
+.startup-failure pre {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.startup-screen.has-error .startup-spinner,
+.startup-screen.has-error .startup-message {
+  display: none;
+}
+
+.startup-screen.has-error .startup-failure {
+  display: block;
+}
+
+@keyframes startup-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .startup-screen { transition: none; }
+  .startup-spinner { animation-duration: 2s; }
+}
