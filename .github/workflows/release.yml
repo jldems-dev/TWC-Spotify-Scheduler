@@ -1,0 +1,69 @@
+name: Publish Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-release:
+    name: Build and publish Windows NSIS release
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Validate tag and reject duplicate release
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          $packageVersion = node -p "require('./package.json').version"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read package.json version.' }
+          $expectedTag = "v$packageVersion"
+          if ($env:RELEASE_TAG -cne $expectedTag) {
+            throw "Tag '$env:RELEASE_TAG' does not match package.json version '$packageVersion' (expected '$expectedTag')."
+          }
+
+          $releaseUri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases/tags/$([uri]::EscapeDataString($env:RELEASE_TAG))"
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $releaseExists = $false
+          try {
+            $null = Invoke-RestMethod -Uri $releaseUri -Headers $headers -Method Get
+            $releaseExists = $true
+          } catch {
+            $statusCode = $_.Exception.Response.StatusCode
+            if ($null -eq $statusCode -or [int]$statusCode -ne 404) { throw }
+          }
+          if ($releaseExists) {
+            throw "A GitHub Release already exists for '$env:RELEASE_TAG'; refusing to overwrite it."
+          }
+          Write-Host "Validated tag $env:RELEASE_TAG for package version $packageVersion; no release exists yet."
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Build and publish Windows installer
+        run: npm run release:win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

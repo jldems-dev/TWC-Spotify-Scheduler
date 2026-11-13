@@ -11,7 +11,8 @@
     "build": "tsc -b && vite --configLoader runner build && tsc -p electron/tsconfig.json",
     "preview": "vite preview",
     "test": "tsc -p electron/tsconfig.json && node --test src/schedule.test.mjs",
-    "package:win": "npm run build && electron-builder --win nsis"
+    "package:win": "npm run build && electron-builder --win nsis",
+    "release:win": "npm run build && electron-builder --win nsis --publish always"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
@@ -37,6 +38,7 @@
     "extraResources": [{ "from": "assets/icons/app-icon-release.ico", "to": "app-icon.ico" }],
     "files": ["dist/**/*", "dist-electron/**/*", "package.json"],
     "win": { "target": "nsis", "icon": "assets/icons/app-icon-release.ico", "artifactName": "TWC-Stafford-Music-Scheduler-Setup-${version}.${ext}" },
-    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "installerIcon": "assets/icons/app-icon-release.ico", "uninstallerIcon": "assets/icons/app-icon-release.ico" }
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "installerIcon": "assets/icons/app-icon-release.ico", "uninstallerIcon": "assets/icons/app-icon-release.ico" },
+    "publish": [{ "provider": "github", "releaseType": "release" }]
   }
 }
