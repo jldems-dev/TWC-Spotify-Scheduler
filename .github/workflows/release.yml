@@ -19,15 +19,19 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          path: source
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: source/package-lock.json
 
       - name: Validate tag and reject duplicate release
         shell: pwsh
+        working-directory: source
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -62,8 +66,10 @@ jobs:
 
       - name: Install locked dependencies
         run: npm ci
+        working-directory: source
 
       - name: Build and publish Windows installer
         run: npm run release:win
+        working-directory: source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
