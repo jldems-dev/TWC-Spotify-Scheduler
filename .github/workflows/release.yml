@@ -91,13 +91,34 @@ jobs:
               $release = Invoke-RestMethod -Uri $releaseUri -Headers $headers -Method Get
               $assets = @($release.assets | ForEach-Object { $_.name })
               $hasLatest = $assets -contains 'latest.yml'
-              $hasInstaller = @($assets | Where-Object { $_ -match '\.exe$' }).Count -gt 0
-              $hasBlockmap = @($assets | Where-Object { $_ -match '\.blockmap$' }).Count -gt 0
+              $installer = @($assets | Where-Object { $_ -match '^TWC-Stafford-Music-Scheduler-Setup-[0-9]+\.[0-9]+\.[0-9]+\.exe$' } | Select-Object -First 1)
+              $hasInstaller = $installer.Count -gt 0
+              $hasBlockmap = $installer.Count -gt 0 -and $assets -contains "$($installer[0]).blockmap"
               if ($hasLatest -and $hasInstaller -and $hasBlockmap) {
-                Write-Host "Verified updater metadata, installer, and blockmap for $env:RELEASE_TAG."
+                Write-Host "Verified latest.yml, $($installer[0]), and its blockmap for $env:RELEASE_TAG."
                 exit 0
               }
+              $missing = @()
+              if (-not $hasLatest) { $missing += 'latest.yml' }
+              if (-not $hasInstaller) { $missing += 'versioned Windows installer EXE' }
+              if ($hasInstaller -and -not $hasBlockmap) { $missing += "$($installer[0]).blockmap" }
+              Write-Host "Waiting for missing release assets: $($missing -join ', '). Uploaded assets: $($assets -join ', ')"
             } catch { Write-Host "Waiting for release assets: $($_.Exception.Message)" }
             Start-Sleep -Seconds 5
           } while ((Get-Date) -lt $deadline)
-          throw "Release $env:RELEASE_TAG is missing latest.yml, installer EXE, or blockmap."
+          $finalAssets = @()
+          try {
+            $release = Invoke-RestMethod -Uri $releaseUri -Headers $headers -Method Get
+            $finalAssets = @($release.assets | ForEach-Object { $_.name })
+          } catch {
+            throw "Could not verify release $env:RELEASE_TAG at $releaseUri after waiting for uploads: $($_.Exception.Message)"
+          }
+          $missing = @()
+          if ($finalAssets -notcontains 'latest.yml') { $missing += 'latest.yml' }
+          $finalInstaller = @($finalAssets | Where-Object { $_ -match '^TWC-Stafford-Music-Scheduler-Setup-[0-9]+\.[0-9]+\.[0-9]+\.exe$' } | Select-Object -First 1)
+          if ($finalInstaller.Count -eq 0) {
+            $missing += 'versioned Windows installer EXE'
+          } elseif ($finalAssets -notcontains "$($finalInstaller[0]).blockmap") {
+            $missing += "$($finalInstaller[0]).blockmap"
+          }
+          throw "Release $env:RELEASE_TAG is missing required updater asset(s): $($missing -join ', '). Uploaded assets: $($finalAssets -join ', ')"

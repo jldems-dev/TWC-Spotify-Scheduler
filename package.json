@@ -63,6 +63,8 @@
     "publish": [
       {
         "provider": "github",
+        "owner": "jldems-dev",
+        "repo": "TWC-Spotify-Scheduler",
         "releaseType": "release"
       }
     ]
