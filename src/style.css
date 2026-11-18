@@ -1761,3 +1761,45 @@ svg {
     padding: 10px;
   }
 }
+
+
+/* Settings page tabs */
+.settings-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  margin: 0 0 16px;
+  padding: 4px;
+  overflow-x: auto;
+  background: var(--brand-grey);
+  border: 1px solid #e3e7f1;
+  border-radius: 9px;
+  scrollbar-width: thin;
+}
+.settings-tabs button {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 7px 14px;
+  color: #5c6f8a;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 500;
+  transition: color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+}
+.settings-tabs button:hover { color: var(--brand-purple); background: #ffffffa8; }
+.settings-tabs button.active {
+  color: var(--brand-purple);
+  background: var(--brand-white);
+  border-color: #e3e7f1;
+  box-shadow: 0 1px 3px #251d5110;
+  font-weight: 600;
+}
+.settings-tabs button:focus-visible {
+  outline: 2px solid var(--brand-blue);
+  outline-offset: 1px;
+}
+.settings-tab-panel { min-width: 0; }
+.settings-tab-panel > .form-panel { margin-top: 0; }

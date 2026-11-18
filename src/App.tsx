@@ -124,6 +124,7 @@ const nav: { name: Page; icon: any }[] = [
 ];
 export default function App() {
   const [page, setPage] = useState<Page>("Home"),
+    [settingsTab, setSettingsTab] = useState("general"),
     [data, setData] = useState<any>(seed),
     [branding, setBranding] = useState<any>({ pharmacyName: "TWC Stafford", pharmacyLogo: "", pharmacyIcon: "", version: "" }),
     [updateStatus, setUpdateStatus] = useState<any>({ status: "idle", currentVersion: "…", message: "Loading update status…" }),
@@ -209,6 +210,9 @@ export default function App() {
   const advertisementAudioRef = useRef<HTMLAudioElement | null>(null);
   const advertisementTestGeneration = useRef(0);
   const advertisementTestBusy = useRef(false);
+  const advertisementPlaybackWasPlaying = useRef(false);
+  const advertisementLastTick = useRef<Date | null>(null);
+  const advertisementClaimed = useRef(new Set<string>());
   const googleImportLock = useRef(false);
   const announcementActionLock = useRef(false);
   const activeAnnouncementAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -249,108 +253,93 @@ export default function App() {
     }
     advertisementAudioRef.current = null;
     setActiveTestAdvertisementId(null);
+    restoreSpotifyAfterAdvertisement();
   };
   const logAdvertisementTest = (level: string, message: string) => {
-    void window.twc.log(level, `Advertisement test: ${message}`).catch(() => undefined);
+    void window.twc.log(level, `Advertisement: ${message}`).catch(() => undefined);
   };
-  const testAdvertisement = async (id: string) => {
-    if (activeTestAdvertisementId === id) {
-      logAdvertisementTest("info", "stopped by user");
+  function restoreSpotifyAfterAdvertisement() {
+    const shouldResume = advertisementPlaybackWasPlaying.current;
+    advertisementPlaybackWasPlaying.current = false;
+    if (!shouldResume) return;
+    void window.twc.spotifyControl("play").catch((error: any) => {
+      notify(`Advertisement finished, but Spotify could not be resumed: ${String(error).replace(/^Error: /, "")}`);
+    });
+  }
+  const playAdvertisement = async (id: string, source: "test" | "scheduled") => {
+    if (source === "test" && activeTestAdvertisementId === id) {
+      logAdvertisementTest("info", "test stopped by user");
       stopTestAdvertisement();
-      return;
+      return false;
     }
-    stopTestAdvertisement();
+    if (advertisementAudioRef.current || advertisementTestBusy.current) {
+      if (source === "scheduled") return false;
+      stopTestAdvertisement();
+    }
     const generation = ++advertisementTestGeneration.current;
     const isCurrent = () => generation === advertisementTestGeneration.current;
     advertisementTestBusy.current = true;
-    logAdvertisementTest("info", `button clicked; advertisement ID ${id}`);
     try {
-      if (typeof id !== "string" || !/^[\w-]{36}$/.test(id)) {
-        throw new Error("The advertisement ID is invalid.");
-      }
-      if (
-        announcementPlayback.current.active ||
-        announcementWindowActive(data.announcementSchedules || [], new Date())
-      ) {
-        notify(
-          "Advertisement preview is unavailable during a scheduled announcement.",
-        );
-        logAdvertisementTest("warn", "blocked because an announcement is active or scheduled");
-        return;
+      if (typeof id !== "string" || !/^[\w-]{36}$/.test(id)) throw new Error("The advertisement ID is invalid.");
+      if (announcementPlayback.current.active || announcementWindowActive(data.announcementSchedules || [], new Date())) {
+        if (source === "test") notify("Advertisement preview is unavailable during a scheduled announcement.");
+        return false;
       }
       const scheduler = await window.twc.schedulerStatus();
-      if (!isCurrent()) return;
+      if (!isCurrent()) return false;
       if (scheduler.quiet) {
-        logAdvertisementTest("warn", "blocked by Quiet Hours");
-        notify("Advertisement preview is blocked during Quiet Hours.");
-        return;
+        if (source === "test") notify("Advertisement preview is blocked during Quiet Hours.");
+        return false;
       }
+      const item = (data.advertisements || []).find((entry: any) => entry.id === id);
+      if (!item || !item.enabled) throw new Error("The advertisement is missing or disabled.");
+      const src = await window.twc.advertisementsAudio(id);
+      if (!isCurrent()) return false;
+      if (typeof src !== "string" || !/^data:audio\/(mpeg|wav);base64,/.test(src)) throw new Error("The advertisement audio file is empty or has an unsupported format.");
       if (spotify.connected) {
         const state = await window.twc.spotifyPlayback();
-        if (!isCurrent()) return;
-        logAdvertisementTest("info", `Spotify playback checked; playing=${state?.is_playing === true}; device available=${state?.device?.is_usable === true}`);
-        if (state?.is_playing) {
-          logAdvertisementTest("warn", "blocked because Spotify is playing");
-          notify(
-            "Advertisement preview is unavailable while Spotify is playing.",
-          );
-          return;
-        }
+        if (!isCurrent()) return false;
+        advertisementPlaybackWasPlaying.current = state?.is_playing === true;
+        if (state?.is_playing) await window.twc.spotifyControl("pause");
       }
-      const src = await window.twc.advertisementsAudio(id);
-      if (!isCurrent()) return;
-      const item = (data.advertisements || []).find(
-        (advertisement: any) => advertisement.id === id,
-      );
-      if (!item) throw new Error("The advertisement record was not found in the library.");
-      if (!item.enabled) throw new Error("This advertisement is disabled.");
-      if (typeof src !== "string" || !/^data:audio\/(mpeg|wav);base64,/.test(src)) throw new Error("The advertisement audio file is empty or has an unsupported format.");
-      logAdvertisementTest("info", `record found; enabled=true; audio loaded; format=${src.startsWith("data:audio/wav") ? "wav" : "mp3"}`);
+      if (!isCurrent()) {
+        restoreSpotifyAfterAdvertisement();
+        return false;
+      }
       const audio = new Audio(src);
-      audio.volume =
-        Math.max(
-          0,
-          Math.min(
-            100,
-            Number(advertisementVolumeDrafts[id] ?? item?.volume ?? 100),
-          ),
-        ) / 100;
+      audio.volume = Math.max(0, Math.min(100, Number(advertisementVolumeDrafts[id] ?? item.volume ?? 100))) / 100;
       advertisementAudioRef.current = audio;
-      setActiveTestAdvertisementId(id);
-      audio.onended = () => {
-        if (advertisementAudioRef.current === audio) {
-          advertisementAudioRef.current = null;
-          setActiveTestAdvertisementId(null);
-          advertisementTestBusy.current = false;
-          logAdvertisementTest("info", `completed; advertisement ID ${id}`);
-        }
+      if (source === "test") setActiveTestAdvertisementId(id);
+      const finish = (success: boolean) => {
+        if (!isCurrent()) return;
+        advertisementAudioRef.current = null;
+        setActiveTestAdvertisementId(null);
+        advertisementTestBusy.current = false;
+        logAdvertisementTest(success ? "info" : "error", `${source} playback ${success ? "completed" : "failed"}; advertisement ID ${id}`);
+        restoreSpotifyAfterAdvertisement();
+        if (!success && source === "test") notify("The advertisement preview could not be played. Check that the audio file is valid.");
       };
-      audio.onerror = () => {
-        if (advertisementAudioRef.current === audio) {
-          advertisementAudioRef.current = null;
-          setActiveTestAdvertisementId(null);
-          advertisementTestBusy.current = false;
-        }
-        logAdvertisementTest("error", `audio element error; code=${audio.error?.code ?? "unknown"}; message=${audio.error?.message || "unavailable"}`);
-        notify(
-          "The advertisement preview could not be played. Check that the audio file is valid.",
-        );
-      };
+      audio.onended = () => finish(true);
+      audio.onerror = () => finish(false);
       await audio.play();
-      if (!isCurrent()) return;
+      if (!isCurrent()) return false;
       if (audio.paused) throw new Error("The audio player did not enter the playing state.");
-      logAdvertisementTest("info", `playback started; advertisement ID ${id}; volume=${Math.round(audio.volume * 100)}%`);
+      logAdvertisementTest("info", `${source} playback started; advertisement ID ${id}; Spotify paused`);
+      return true;
     } catch (error) {
-      if (!isCurrent()) return;
-      logAdvertisementTest("error", `playback failed; advertisement ID ${id}; ${String(error)}`);
-      stopTestAdvertisement();
-      notify(
-        `Advertisement preview failed: ${String(error).replace(/^Error: /, "")}`,
-      );
+      if (!isCurrent()) return false;
+      advertisementAudioRef.current = null;
+      setActiveTestAdvertisementId(null);
+      advertisementTestBusy.current = false;
+      logAdvertisementTest("error", `${source} playback failed; ${String(error)}`);
+      restoreSpotifyAfterAdvertisement();
+      if (source === "test") notify(`Advertisement preview failed: ${String(error).replace(/^Error: /, "")}`);
+      return false;
     } finally {
       if (isCurrent()) advertisementTestBusy.current = false;
     }
   };
+  const testAdvertisement = (id: string) => void playAdvertisement(id, "test");
   useEffect(() => {
     if (!activeTestAdvertisementId) return;
     let checkInFlight = false;
@@ -742,6 +731,72 @@ export default function App() {
     const timer = window.setInterval(tick, 1000);
     return () => window.clearInterval(timer);
   }, [data.announcementSchedules, data.announcements, spotify.connected]);
+  useEffect(() => {
+    const randomKey = (scheduleId: string) => `twc-advertisement-random-next:${scheduleId}`;
+    const randomMinutes = (schedule: any) => Math.floor(Math.random() * (schedule.maxIntervalMinutes - schedule.minIntervalMinutes + 1)) + schedule.minIntervalMinutes;
+    const dayIndex = (date: Date) => (date.getDay() + 6) % 7;
+    const inWindow = (schedule: any, date: Date) => {
+      const day = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][dayIndex(date)];
+      const minute = date.getHours() * 60 + date.getMinutes();
+      const [startHour, startMinute] = schedule.start.split(":").map(Number);
+      const [endHour, endMinute] = schedule.end.split(":").map(Number);
+      return schedule.enabled && schedule.days.includes(day) && minute >= startHour * 60 + startMinute && minute < endHour * 60 + endMinute;
+    };
+    const chooseAdvertisement = (schedule: any, occurrenceKey: string) => {
+      const ids = (schedule.advertisementIds || []).filter((id: string) => (data.advertisements || []).some((item: any) => item.id === id && item.enabled));
+      if (!ids.length) return null;
+      if (!schedule.rotate || ids.length === 1) return ids[0];
+      const countKey = `twc-advertisement-rotation:${schedule.id}`;
+      const count = Number(localStorage.getItem(countKey) || 0);
+      localStorage.setItem(countKey, String(count + 1));
+      return ids[count % ids.length];
+    };
+    const tick = () => {
+      const now = new Date();
+      const minute = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes());
+      if (advertisementLastTick.current?.getTime() === minute.getTime()) return;
+      advertisementLastTick.current = minute;
+      for (const schedule of data.advertisementSchedules || []) {
+        if (!schedule.enabled || !inWindow(schedule, now)) continue;
+        let due = false;
+        let occurrenceKey = `${schedule.id}:${minute.getTime()}`;
+        if (schedule.type === "weekly") {
+          const clock = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+          due = schedule.times?.includes(clock) === true;
+        } else if (schedule.type === "repeat") {
+          const [hour, mins] = schedule.start.split(":").map(Number);
+          const elapsed = now.getHours() * 60 + now.getMinutes() - (hour * 60 + mins);
+          due = elapsed >= 0 && elapsed % schedule.repeatIntervalMinutes === 0;
+        } else if (schedule.type === "random") {
+          const storageKey = randomKey(schedule.id);
+          let nextAt = Number(localStorage.getItem(storageKey) || 0);
+          if (!nextAt) {
+            nextAt = now.getTime() + randomMinutes(schedule) * 60_000;
+            localStorage.setItem(storageKey, String(nextAt));
+          }
+          due = now.getTime() >= nextAt;
+          if (due) {
+            occurrenceKey = `${schedule.id}:${Math.floor(nextAt / 60_000)}`;
+            localStorage.setItem(storageKey, String(now.getTime() + randomMinutes(schedule) * 60_000));
+          }
+        }
+        if (!due) continue;
+        const claimKey = `twc-advertisement:${occurrenceKey}`;
+        if (advertisementClaimed.current.has(claimKey) || localStorage.getItem(claimKey)) continue;
+        advertisementClaimed.current.add(claimKey);
+        localStorage.setItem(claimKey, "1");
+        const id = chooseAdvertisement(schedule, occurrenceKey);
+        if (!id) {
+          void window.twc.log("error", `Scheduled advertisement audio is missing or disabled for "${schedule.name}".`);
+          continue;
+        }
+        void playAdvertisement(id, "scheduled");
+      }
+    };
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [data.advertisementSchedules, data.advertisements, data.announcementSchedules, spotify.connected]);
   useEffect(() => {
     for (const item of data.announcements || [])
       void window.twc
@@ -2695,11 +2750,7 @@ export default function App() {
                     }
                   />
                   <div className="panel">
-                    <h3>Advertisement library</h3>
-                    <p className="audio-policy-note">
-                      Advertisement previews are local only. Automatic playback
-                      alongside Spotify is disabled pending policy approval.
-                    </p>
+                    <h3>Advertisement library</h3> 
                     {(data.advertisements || []).length ? (
                       <div className="schedule-list">
                         {data.advertisements.map((item: any) => (
@@ -2841,12 +2892,7 @@ export default function App() {
                       {advertisementScheduleForm.id
                         ? "Edit advertisement schedule"
                         : "Create advertisement schedule"}
-                    </h3>
-                    <p className="audio-policy-note">
-                      Schedules are saved as configuration only. Automatic
-                      playback alongside Spotify remains disabled pending policy
-                      approval.
-                    </p>
+                    </h3> 
                     <label>
                       Schedule name
                       <input
@@ -3158,11 +3204,7 @@ export default function App() {
                               <span>
                                 {schedule.type} · {description} ·{" "}
                                 {names.join(schedule.rotate ? " → " : ", ")}
-                              </span>
-                              <span className="audio-schedule-blocked">
-                                Automatic playback disabled pending policy
-                                approval
-                              </span>
+                              </span> 
                             </div>
                             <label className="toggle-label">
                               <input
@@ -3243,6 +3285,13 @@ export default function App() {
                 title="Settings"
                 sub="Application preferences and connected services."
               />
+              <div className="settings-tabs" role="tablist" aria-label="Settings sections">
+                {[["general", "General"], ["updates", "Updates"], ["spotify", "Spotify"], ["google", "Google Business"], ["scheduler", "Scheduler"], ["audio", "Audio"]].map(([id, label]) => (
+                  <button key={id} id={`settings-tab-${id}`} type="button" role="tab" aria-selected={settingsTab === id} aria-controls={`settings-panel-${id}`} tabIndex={settingsTab === id ? 0 : -1} className={settingsTab === id ? "active" : ""} onClick={() => setSettingsTab(id)}>{label}</button>
+                ))}
+              </div>
+              {settingsTab === "updates" && (
+                <div id="settings-panel-updates" role="tabpanel" aria-labelledby="settings-tab-updates" className="settings-tab-panel">
               <div className="panel form-panel updater-panel">
                 <h3>Application Updates</h3>
                 <div className="setting-readonly"><b>Installed version</b><span>{updateStatus.currentVersion || branding.version || "…"}</span></div>
@@ -3253,6 +3302,10 @@ export default function App() {
                   {updateStatus.status === "downloaded" && <button className="primary" onClick={() => void window.twc.updaterInstall().catch((error) => notify(String(error).replace(/^Error: /, "")))}>Restart and Install Update{updateStatus.version ? ` ${updateStatus.version}` : ""}</button>}
                 </div>
               </div>
+                </div>
+               )}
+              {settingsTab === "general" && (
+                <div id="settings-panel-general" role="tabpanel" aria-labelledby="settings-tab-general" className="settings-tab-panel">
               <div className="panel form-panel branding-panel">
                 <h3>Application Branding</h3>
                 <p>Personalize the name and images shown in this installation.</p>
@@ -3264,6 +3317,10 @@ export default function App() {
                 <small>PNG, JPG, JPEG, or WebP. Maximum file size: 5 MB. The Windows executable icon is set during packaging.</small>
                 <div className="form-inline"><button className="primary" onClick={() => void window.twc.brandingSave(branding).then(setBranding).then(() => notify("Application branding saved.")).catch((e) => notify(String(e).replace(/^Error: /, "")))}>Save Changes</button><button className="subtle" onClick={() => void window.twc.brandingReset().then(setBranding).then(() => notify("Default TWC branding restored.")).catch((e) => notify(String(e)))}>Reset to Default</button></div>
               </div>
+                </div>
+               )}
+              {settingsTab === "spotify" && (
+                <div id="settings-panel-spotify" role="tabpanel" aria-labelledby="settings-tab-spotify" className="settings-tab-panel">
               <div className="panel form-panel">
                 <h3>Spotify</h3>
                 <p>
@@ -3322,6 +3379,10 @@ export default function App() {
                   </a>
                 </small>
               </div>
+                </div>
+               )}
+              {settingsTab === "google" && (
+                <div id="settings-panel-google" role="tabpanel" aria-labelledby="settings-tab-google" className="settings-tab-panel">
               <div className="panel form-panel google-panel">
                 <h3>Google Business Profile</h3>
                 <p>
@@ -3797,7 +3858,11 @@ export default function App() {
                     </div>
                   </div>
                 )}
-              </div>{" "}
+              </div>
+                </div>
+              )}
+              {settingsTab === "scheduler" && (
+                <div id="settings-panel-scheduler" role="tabpanel" aria-labelledby="settings-tab-scheduler" className="settings-tab-panel">
               <div className="panel form-panel">
                 <h3>Scheduler</h3>
                 <div className="setting-readonly">
@@ -3849,6 +3914,10 @@ export default function App() {
                   Restore settings defaults
                 </button>
               </div>
+                </div>
+               )}
+              {settingsTab === "audio" && (
+                <div id="settings-panel-audio" role="tabpanel" aria-labelledby="settings-tab-audio" className="settings-tab-panel">
               <div className="panel form-panel">
                 <h3>Audio</h3>
                 <p>
@@ -3861,6 +3930,8 @@ export default function App() {
                   Test audio output
                 </button>
               </div>
+                </div>
+               )}
             </>
           )}
           {page === "Logs" && (
