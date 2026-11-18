@@ -12,7 +12,7 @@
     "preview": "vite preview",
     "test": "tsc -p electron/tsconfig.json && node --test src/schedule.test.mjs",
     "package:win": "npm run build && electron-builder --win nsis",
-    "release:win": "npm run build && electron-builder --win nsis --publish always"
+    "release:win": "electron-builder --win nsis"
   },
   "dependencies": {
     "electron-updater": "6.8.12",
