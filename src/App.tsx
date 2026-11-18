@@ -103,6 +103,8 @@ const seed = {
     spotifyClientId: "",
     defaultPlaylist: "",
     schedulerEnabled: true,
+    startWithWindows: false,
+    startMinimizedToTray: false,
   },
   schedules: [] as Schedule[],
   exceptions: [] as any[],
@@ -3298,14 +3300,31 @@ export default function App() {
                 <p className={`updater-message updater-${updateStatus.status}`}>{updateStatus.message}</p>
                 {updateStatus.status === "downloading" && <div className="update-progress" role="progressbar" aria-label="Update download progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={updateStatus.percent || 0}><span style={{ width: `${updateStatus.percent || 0}%` }} /></div>}
                 <div className="form-inline">
-                  <button className="primary" disabled={["unsupported", "checking", "available", "downloading", "downloaded"].includes(updateStatus.status)} onClick={() => { void window.twc.updaterCheck().then(setUpdateStatus).catch((error) => notify(String(error).replace(/^Error: /, ""))); }}>{updateStatus.status === "checking" ? "Checking…" : "Check for Updates"}</button>
-                  {updateStatus.status === "downloaded" && <button className="primary" onClick={() => void window.twc.updaterInstall().catch((error) => notify(String(error).replace(/^Error: /, "")))}>Restart and Install Update{updateStatus.version ? ` ${updateStatus.version}` : ""}</button>}
+                  {updateStatus.status === "downloaded" ? (
+                    <button className="primary" onClick={() => { void window.twc.updaterInstall().then((started) => { if (!started) notify("The update installation could not be started. Please try again."); }).catch((error) => notify(String(error).replace(/^Error: /, ""))); }}>Restart and Install Update{updateStatus.version ? ` ${updateStatus.version}` : ""}</button>
+                  ) : updateStatus.status !== "installing" && (
+                    <button className="primary" disabled={["unsupported", "checking", "available", "downloading"].includes(updateStatus.status)} onClick={() => { void window.twc.updaterCheck().then(setUpdateStatus).catch((error) => notify(String(error).replace(/^Error: /, ""))); }}>{updateStatus.status === "checking" ? "Checking…" : "Check for Updates"}</button>
+                  )}
                 </div>
               </div>
                 </div>
                )}
               {settingsTab === "general" && (
                 <div id="settings-panel-general" role="tabpanel" aria-labelledby="settings-tab-general" className="settings-tab-panel">
+              <div className="panel form-panel">
+                <h3>Startup &amp; Application Behavior</h3>
+                <p>Choose how TWC Spotify Scheduler starts on this Windows computer.</p>
+                <label className="checkline">
+                  <input type="checkbox" checked={!!data.settings.startWithWindows} onChange={(e) => updateSetting("startWithWindows", e.target.checked)} />
+                  Start with Windows
+                </label>
+                <small>Automatically launch the application when you sign in to Windows.</small>
+                <label className="checkline">
+                  <input type="checkbox" checked={!!data.settings.startMinimizedToTray} onChange={(e) => updateSetting("startMinimizedToTray", e.target.checked)} />
+                  Start Minimized to System Tray
+                </label>
+                <small>When launched at Windows sign-in, keep the main window hidden until you open it from the tray.</small>
+              </div>
               <div className="panel form-panel branding-panel">
                 <h3>Application Branding</h3>
                 <p>Personalize the name and images shown in this installation.</p>

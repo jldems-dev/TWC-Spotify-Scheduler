@@ -4,6 +4,8 @@ import {
   ipcMain,
   dialog,
   Menu,
+  Tray,
+  nativeImage,
   safeStorage,
   shell,
   powerMonitor,
@@ -71,6 +73,8 @@ const empty: Store = {
     googleClientId: "",
     defaultPlaylist: "",
     schedulerEnabled: true,
+    startWithWindows: false,
+    startMinimizedToTray: false,
     pharmacyName: "TWC Stafford",
     pharmacyLogo: "",
     pharmacyIcon: "",
@@ -254,6 +258,8 @@ async function readStore(): Promise<Store> {
   const validDays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   const validData =
     (sourceSettings.schedulerEnabled === undefined || typeof sourceSettings.schedulerEnabled === "boolean") &&
+    (sourceSettings.startWithWindows === undefined || typeof sourceSettings.startWithWindows === "boolean") &&
+    (sourceSettings.startMinimizedToTray === undefined || typeof sourceSettings.startMinimizedToTray === "boolean") &&
     (sourceSettings.spotifyClientId === undefined || (typeof sourceSettings.spotifyClientId === "string" && sourceSettings.spotifyClientId.length <= 200)) &&
     (sourceSettings.googleClientId === undefined || (typeof sourceSettings.googleClientId === "string" && sourceSettings.googleClientId.length <= 300)) &&
     (sourceSettings.defaultPlaylist === undefined || (typeof sourceSettings.defaultPlaylist === "string" && sourceSettings.defaultPlaylist.length <= 256)) &&
@@ -291,6 +297,8 @@ async function readStore(): Promise<Store> {
   return {
     settings: {
       schedulerEnabled: sourceSettings.schedulerEnabled ?? empty.settings.schedulerEnabled,
+      startWithWindows: sourceSettings.startWithWindows ?? false,
+      startMinimizedToTray: sourceSettings.startMinimizedToTray ?? false,
       spotifyClientId: sourceSettings.spotifyClientId ?? empty.settings.spotifyClientId,
       googleClientId: sourceSettings.googleClientId ?? "",
       ...(typeof sourceSettings.googleLocation === "string" ? { googleLocation: sourceSettings.googleLocation } : {}),
@@ -519,11 +527,13 @@ async function spotifyStatus() {
   }
 }
 let win: BrowserWindow;
+let tray: Tray | null = null;
 let scheduleCoordinator: ScheduleCoordinator | undefined;
 let shutdownLogging = false;
-type UpdateStatus = { status: "unsupported" | "idle" | "checking" | "current" | "available" | "downloading" | "downloaded" | "error"; currentVersion: string; version?: string; percent?: number; message: string };
+type UpdateStatus = { status: "unsupported" | "idle" | "checking" | "current" | "available" | "downloading" | "downloaded" | "installing" | "error"; currentVersion: string; version?: string; percent?: number; message: string };
 let updaterStatus: UpdateStatus = { status: "idle", currentVersion: app.getVersion(), message: "Updates have not been checked yet." };
 let updaterCheckPromise: Promise<void> | null = null;
+let updaterInstallRequested = false;
 function publishUpdaterStatus(next: UpdateStatus, log?: { level: "info" | "warn" | "error"; message: string }) {
   updaterStatus = { ...next, currentVersion: app.getVersion() };
   for (const window of BrowserWindow.getAllWindows()) {
@@ -583,6 +593,10 @@ function assertTrustedSender(event: Electron.IpcMainInvokeEvent) {
   if (isTrustedAppUrl(event.senderFrame.url)) return;
   throw new Error("IPC is only accepted from the application window.");
 }
+function syncWindowsLoginItem(enabled: boolean) {
+  if (process.platform !== "win32" || !app.isPackaged) return;
+  app.setLoginItemSettings({ openAtLogin: enabled, args: ["--startup-tray"] });
+}
 function isTrustedAppUrl(raw: string) {
   try {
     const url = new URL(raw);
@@ -601,7 +615,34 @@ function isTrustedAppUrl(raw: string) {
     return false;
   }
 }
-function createWindow() {
+function restoreMainWindow() {
+  if (!win || win.isDestroyed()) return;
+  win.setSkipTaskbar(false);
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
+function createTray() {
+  if (tray) return;
+  const iconPath = app.isPackaged
+    ? path.join(process.resourcesPath, "app-icon.ico")
+    : path.join(app.getAppPath(), "assets/icons/app-icon.ico");
+  const icon = nativeImage.createFromPath(iconPath);
+  if (icon.isEmpty()) {
+    startupLog("Could not create startup tray icon because the application icon is unavailable.");
+    return;
+  }
+  tray = new Tray(icon);
+  tray.setToolTip("TWC Stafford Music Scheduler");
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: "Open TWC Spotify Scheduler", click: restoreMainWindow },
+    { type: "separator" },
+    { label: "Quit", click: () => app.quit() },
+  ]));
+  tray.on("click", restoreMainWindow);
+  tray.on("double-click", restoreMainWindow);
+}
+function createWindow(showWindow = true) {
   const iconPath = app.isPackaged
     ? path.join(process.resourcesPath, "app-icon.ico")
     : path.join(app.getAppPath(), "assets/icons/app-icon.ico");
@@ -613,6 +654,8 @@ function createWindow() {
   minHeight: 600,
   title: "TWC Stafford Music Scheduler",
   backgroundColor: "#f7f9fc",
+  show: false,
+  skipTaskbar: !showWindow,
   autoHideMenuBar: true,
   frame: false,
   ...(existsSync(iconPath) ? { icon: iconPath } : {}),
@@ -625,6 +668,9 @@ function createWindow() {
     backgroundThrottling: false,
   },
 });
+  win.once("ready-to-show", () => {
+    if (showWindow) win.show();
+  });
   win.webContents.setWindowOpenHandler(({ url }) => {
     try {
       const parsed = new URL(url);
@@ -728,7 +774,15 @@ app
     startupLog(
       `Electron ready; packaged=${app.isPackaged}; appPath=${app.getAppPath()}; localTimeZone=${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
     );
-    createWindow();
+    const storeAtStartup = await readStore();
+    // Windows does not expose wasOpenedAtLogin through Electron; this marker is
+    // supplied only by the login item configured below.
+    const openedAtLogin = process.platform === "win32" && app.isPackaged && process.argv.includes("--startup-tray");
+    try { syncWindowsLoginItem(storeAtStartup.settings.startWithWindows === true); }
+    catch (error) { startupLog(`Could not synchronize Windows startup registration: ${String(error)}`); }
+    const startMinimized = !!openedAtLogin && storeAtStartup.settings.startMinimizedToTray === true;
+    if (startMinimized) createTray();
+    createWindow(!startMinimized);
     initializeUpdater();
     void updateWindowTitle().catch(() => undefined);
     app.on("activate", () => {
@@ -788,6 +842,10 @@ process.on("unhandledRejection", (reason) => {
 });
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
+});
+app.on("will-quit", () => {
+  tray?.destroy();
+  tray = null;
 });
 ipcMain.handle("data:load", (event) => {
   assertTrustedSender(event);
@@ -864,11 +922,13 @@ ipcMain.handle("updater:check", async (event) => {
 });
 ipcMain.handle("updater:install", async (event) => {
   assertTrustedSender(event);
-  if (!app.isPackaged || updaterStatus.status !== "downloaded") return false;
-  const response = await dialog.showMessageBox(win, { type: "info", title: "Install application update", message: `Version ${updaterStatus.version || "new"} is ready to install.`, detail: "The application will close and restart to finish installing the update.", buttons: ["Restart and Install", "Later"], defaultId: 0, cancelId: 1, noLink: true });
-  if (response.response !== 0) return false;
+  if (!app.isPackaged || updaterStatus.status !== "downloaded" || updaterInstallRequested) return false;
+  updaterInstallRequested = true;
   void addLog("info", `[updater] User confirmed restart and installation of version ${updaterStatus.version || "new"}.`).catch(() => undefined);
-  autoUpdater.quitAndInstall(false, true);
+  publishUpdaterStatus({ status: "installing", currentVersion: app.getVersion(), version: updaterStatus.version, percent: 100, message: `Closing the application to silently install version ${updaterStatus.version || "new"}…` });
+  // The user approved by clicking the renderer's install button. Keep NSIS
+  // first-install behavior unchanged; electron-updater uses its silent update path here.
+  autoUpdater.quitAndInstall(true, true);
   return true;
 });
 ipcMain.handle("data:save", async (_e, input) => {
@@ -1012,10 +1072,12 @@ ipcMain.handle("data:save", async (_e, input) => {
       !validImage
     ) throw new Error("Invalid Spotify playlist data.");
   }
-  const settingKeys = new Set(["schedulerEnabled", "spotifyClientId", "googleClientId", "googleLocation", "googleLocationTitle", "googleLastSync", "googleSyncMinutes", "defaultPlaylist", "timezone", "pharmacyName", "pharmacyLogo", "pharmacyIcon"]);
+  const settingKeys = new Set(["schedulerEnabled", "startWithWindows", "startMinimizedToTray", "spotifyClientId", "googleClientId", "googleLocation", "googleLocationTitle", "googleLastSync", "googleSyncMinutes", "defaultPlaylist", "timezone", "pharmacyName", "pharmacyLogo", "pharmacyIcon"]);
   if (
     Object.keys(input.settings).some((key) => !settingKeys.has(key)) ||
     typeof input.settings.schedulerEnabled !== "boolean" ||
+    (input.settings.startWithWindows !== undefined && typeof input.settings.startWithWindows !== "boolean") ||
+    (input.settings.startMinimizedToTray !== undefined && typeof input.settings.startMinimizedToTray !== "boolean") ||
     typeof input.settings.spotifyClientId !== "string" ||
     input.settings.spotifyClientId.length > 200 ||
     (input.settings.googleClientId !== undefined && (typeof input.settings.googleClientId !== "string" || input.settings.googleClientId.length > 300)) ||
@@ -1030,6 +1092,8 @@ ipcMain.handle("data:save", async (_e, input) => {
     await writeStore({
       settings: {
         schedulerEnabled: input.settings.schedulerEnabled,
+        startWithWindows: input.settings.startWithWindows === true,
+        startMinimizedToTray: input.settings.startMinimizedToTray === true,
         spotifyClientId: input.settings.spotifyClientId,
         googleClientId: input.settings.googleClientId || "",
         ...(typeof input.settings.googleLocation === "string" ? { googleLocation: input.settings.googleLocation } : {}),
@@ -1055,6 +1119,11 @@ ipcMain.handle("data:save", async (_e, input) => {
       advertisementSchedules: Array.isArray(input.advertisementSchedules) ? input.advertisementSchedules.map(normalizeAdvertisementSchedule).filter(Boolean) : current.advertisementSchedules,
     });
   });
+  try {
+    syncWindowsLoginItem(input.settings.startWithWindows === true);
+  } catch (error) {
+    void addLog("warn", `Could not update Windows startup registration: ${String(error)}`).catch(() => undefined);
+  }
   void scheduleCoordinator?.tick("poll");
   return true;
 });
