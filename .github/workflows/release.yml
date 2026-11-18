@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to publish or repair
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -29,14 +35,11 @@ jobs:
           cache: npm
           cache-dependency-path: source/package-lock.json
 
-      - name: Validate tag and reject duplicate release
+      - name: Validate tag matches package version
         shell: pwsh
         working-directory: source
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_API_URL: ${{ github.api_url }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
           $packageVersion = node -p "require('./package.json').version"
           if ($LASTEXITCODE -ne 0) { throw 'Could not read package.json version.' }
@@ -44,41 +47,54 @@ jobs:
           if ($env:RELEASE_TAG -cne $expectedTag) {
             throw "Tag '$env:RELEASE_TAG' does not match package.json version '$packageVersion' (expected '$expectedTag')."
           }
-
-          $releaseUri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases/tags/$([uri]::EscapeDataString($env:RELEASE_TAG))"
-          $headers = @{
-            Authorization = "Bearer $env:GITHUB_TOKEN"
-            Accept = 'application/vnd.github+json'
-            'X-GitHub-Api-Version' = '2022-11-28'
-          }
-          $releaseExists = $false
-          try {
-            $null = Invoke-RestMethod -Uri $releaseUri -Headers $headers -Method Get
-            $releaseExists = $true
-          } catch {
-            $statusCode = $_.Exception.Response.StatusCode
-            if ($null -eq $statusCode -or [int]$statusCode -ne 404) { throw }
-          }
-          if ($releaseExists) {
-            throw "A GitHub Release already exists for '$env:RELEASE_TAG'; refusing to overwrite it."
-          }
-          Write-Host "Validated tag $env:RELEASE_TAG for package version $packageVersion; no release exists yet."
+          Write-Host "Validated tag $env:RELEASE_TAG for package version $packageVersion."
 
       - name: Install locked dependencies
         run: npm ci
         working-directory: source
 
-      - name: Build and publish Windows installer
+      - name: Build Windows installer
         run: npm run release:win
+        working-directory: source
+
+      - name: Upload updater release assets
+        shell: pwsh
         working-directory: source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          $packageVersion = node -p "require('./package.json').version"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read package.json version.' }
+          $installerName = "TWC-Stafford-Music-Scheduler-Setup-$packageVersion.exe"
+          $requiredNames = @('latest.yml', $installerName, "$installerName.blockmap")
+          $assets = @(Get-ChildItem -LiteralPath 'release' -File | Where-Object { $_.Name -in $requiredNames })
+          $missingFiles = @($requiredNames | Where-Object { $_ -notin $assets.Name })
+          if ($missingFiles.Count -gt 0) {
+            throw "Build output is missing required asset(s): $($missingFiles -join ', ')"
+          }
+
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:RELEASE_TAG `
+              --repo $env:GITHUB_REPOSITORY `
+              --verify-tag `
+              --title $env:RELEASE_TAG `
+              --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw "Could not create GitHub Release $env:RELEASE_TAG." }
+          }
+
+          $assetPaths = @($assets | ForEach-Object { $_.FullName })
+          & gh release upload $env:RELEASE_TAG @assetPaths --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw "GitHub CLI failed to upload assets for $env:RELEASE_TAG." }
+          Write-Host "Uploaded $($assets.Name -join ', ') to $env:GITHUB_REPOSITORY release $env:RELEASE_TAG."
 
       - name: Verify updater release assets
         shell: pwsh
         working-directory: source
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_API_URL: ${{ github.api_url }}
           GITHUB_REPOSITORY: ${{ github.repository }}
