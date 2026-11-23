@@ -1,16 +1,288 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { schedulesConflict, validateSchedule, formatLocalDateTime, nextScheduledAction, scheduleBoundariesAt, activeQuietSchedules } from './schedule.mjs';
-import { ScheduleCoordinator, boundariesAt as schedulerBoundariesAt, activeQuietSchedules as schedulerQuietSchedules } from '../dist-electron/scheduler.js';
+import { ScheduleCoordinator, boundariesAt as schedulerBoundariesAt, boundariesBetween as schedulerBoundariesBetween, activeQuietSchedules as schedulerQuietSchedules } from '../dist-electron/scheduler.js';
 import { validateOAuthCallback, spotifyHttpError, readSpotifyResponse, requestSpotifyApi } from '../dist-electron/spotify-utils.js';
 import { captureQuietPlayback, quietRestorePlan } from '../dist-electron/quiet-state.js';
 import { activeDeviceId, playbackCommand, playlistPlaybackCommand, transferPlaybackCommand, shouldLaunchSpotifyDesktop } from '../dist-electron/spotify-playback.js';
 import { missingPlaybackScopes, sanitizeSpotifyDevices, startScheduledPlayback } from '../dist-electron/scheduled-playback.js';
-import { announcementEventsAt, announcementWindowActive, validateAnnouncementSchedule, saveAnnouncementSchedule, removeAnnouncementSchedule, setAnnouncementScheduleEnabled, upcomingAnnouncementOccurrences } from './announcement-scheduler.mjs';
+import { announcementEventsAt, unexpiredAnnouncementEvents, announcementWindowActive, validateAnnouncementSchedule, saveAnnouncementSchedule, removeAnnouncementSchedule, setAnnouncementScheduleEnabled, upcomingAnnouncementOccurrences } from './announcement-scheduler.mjs';
 import { validateAdvertisementSchedule, normalizeAdvertisementSchedule, saveAdvertisementSchedule, removeAdvertisementSchedule, setAdvertisementScheduleEnabled } from '../dist-electron/advertisement-schedule.js';
+import { AnnouncementService } from '../dist-electron/announcement-service.js';
+import { BackupService } from '../dist-electron/backup-service.js';
+import { classifySpotifyHealth, shouldRecoverUnexpectedStop } from '../dist-electron/spotify-monitor.js';
+import { isApprovedExternalUrl, isTrustedIpcRequest, redactSecrets } from '../dist-electron/security-utils.js';
+
+describe('encrypted application backups', () => {
+  const audioId = '11111111-1111-4111-8111-111111111111';
+  const setup = async (availableSpace = undefined) => {
+    const base = await mkdtemp(path.join(os.tmpdir(), 'twc-backup-test-'));
+    const userData = path.join(base, 'user-data'), destination = path.join(base, 'backups');
+    await mkdir(userData, { recursive: true }); await mkdir(destination, { recursive: true });
+    const saved = { settings: { pharmacyName: 'TWC Test', spotifyClientId: 'public-client-id' }, schedules: [{ id: 'schedule-1' }], exceptions: [], playlists: [], logs: [{ message: 'should not enter the backup' }], announcements: [{ id: audioId, file: `${audioId}.mp3`, enabled: true }], announcementSchedules: [{ id: 'announcement-schedule' }], advertisements: [], advertisementSchedules: [] };
+    await writeFile(path.join(userData, 'scheduler-data.json'), JSON.stringify(saved));
+    await writeFile(path.join(userData, 'scheduler-runs.json'), JSON.stringify({ events: { occurrence: { status: 'completed' } } }));
+    await writeFile(path.join(userData, 'announcement-runs.json'), JSON.stringify({ runs: [{ status: 'completed' }] }));
+    await mkdir(path.join(userData, 'announcements')); await writeFile(path.join(userData, 'announcements', `${audioId}.mp3`), Buffer.from('announcement audio sample'));
+    await mkdir(path.join(userData, 'branding')); await writeFile(path.join(userData, 'branding', `${audioId}.png`), Buffer.from('branding image sample'));
+    await writeFile(path.join(userData, 'spotify-token.bin'), Buffer.from('encrypted-token-fixture'));
+    const master = Buffer.alloc(32, 0x5a);
+    const protectKey = key => { const iv = crypto.randomBytes(12), cipher = crypto.createCipheriv('aes-256-gcm', master, iv), ciphertext = Buffer.concat([cipher.update(key), cipher.final()]); return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]); };
+    const unprotectKey = wrapped => { const decipher = crypto.createDecipheriv('aes-256-gcm', master, wrapped.subarray(0, 12)); decipher.setAuthTag(wrapped.subarray(12, 28)); return Buffer.concat([decipher.update(wrapped.subarray(28)), decipher.final()]); };
+    const encodeArchive = plain => { const key = crypto.randomBytes(32), wrapped = protectKey(key), iv = crypto.randomBytes(12), cipher = crypto.createCipheriv('aes-256-gcm', key, iv), encrypted = Buffer.concat([cipher.update(plain), cipher.final()]), header = Buffer.concat([Buffer.from('TWCSBKP1'), Buffer.alloc(4), wrapped, iv, cipher.getAuthTag()]); header.writeUInt32BE(wrapped.length, 8); return Buffer.concat([header, encrypted]); };
+    const service = new BackupService({ userData, defaultDirectory: destination, configFile: path.join(userData, 'backup-settings.json'), appVersion: 'test-1.0', protectKey, unprotectKey,
+      ...(availableSpace === undefined ? {} : { availableSpace: async () => availableSpace }),
+      getOverrides: async () => { const value = JSON.parse(await readFile(path.join(userData, 'scheduler-data.json'), 'utf8')); return { 'scheduler-data.json': Buffer.from(JSON.stringify({ ...value, logs: [] })) }; },
+      validateSnapshot: (bytes, paths) => { const value = JSON.parse(bytes.toString()); for (const item of value.announcements || []) if (!paths.includes(`announcements/${item.file}`)) throw new Error('A referenced announcement audio file is missing.'); },
+      validateStore: bytes => { const parsed = JSON.parse(bytes.toString()); assert.ok(Array.isArray(parsed.schedules)); }, log: async () => {} });
+    return { base, userData, destination, saved, service, encodeArchive };
+  };
+  it('creates a unique encrypted backup with settings, ledgers, audio, and branding but excludes application logs', async () => {
+    const ctx = await setup();
+    try {
+      const result = await ctx.service.createBackup('manual', { force: true });
+      const archive = await readFile(result.file);
+      assert.match(result.file, /TWC-Scheduler-backup-.*\.twcbak$/);
+      assert.equal(archive.subarray(0, 8).toString(), 'TWCSBKP1');
+      assert.equal(archive.includes(Buffer.from('should not enter the backup')), false);
+      assert.equal(archive.includes(Buffer.from('announcement audio sample')), false);
+      assert.equal(archive.includes(Buffer.from('encrypted-token-fixture')), false);
+      const preview = await ctx.service.selectRestoreFile(async () => result.file);
+      assert.equal(preview.appVersion, 'test-1.0');
+      assert.ok(preview.categories.includes('Announcement audio'));
+      assert.ok(preview.categories.includes('Scheduler and announcement history'));
+    } finally { await ctx.service.stop(); await rm(ctx.base, { recursive: true, force: true }); }
+  });
+  it('validates, safety-backs up, and restores settings and referenced audio', async () => {
+    const ctx = await setup();
+    try {
+      const backup = await ctx.service.createBackup('manual', { force: true });
+      const changed = { ...ctx.saved, settings: { pharmacyName: 'Changed' }, schedules: [] };
+      await writeFile(path.join(ctx.userData, 'scheduler-data.json'), JSON.stringify(changed));
+      await writeFile(path.join(ctx.userData, 'announcements', `${audioId}.mp3`), Buffer.from('changed audio'));
+      ctx.service.deps.appVersion = 'current-2.0';
+      const selected = await ctx.service.selectRestoreFile(async () => backup.file);
+      const restored = await ctx.service.restore(selected.token);
+      assert.equal(restored.appVersion, 'test-1.0');
+      const data = JSON.parse(await readFile(path.join(ctx.userData, 'scheduler-data.json'), 'utf8'));
+      assert.equal(data.settings.pharmacyName, 'TWC Test');
+      assert.equal(data.schedules[0].id, 'schedule-1');
+      assert.deepEqual(data.logs, []);
+      assert.equal((await readFile(path.join(ctx.userData, 'announcements', `${audioId}.mp3`))).toString(), 'announcement audio sample');
+      assert.equal(ctx.service.status().settings.history.filter(item => item.reasonType === 'pre-restore').length, 1);
+    } finally { await ctx.service.stop(); await rm(ctx.base, { recursive: true, force: true }); }
+  });
+  it('rejects corrupted and unsupported archives before creating a restore selection', async () => {
+    const ctx = await setup();
+    try {
+      const backup = await ctx.service.createBackup('manual', { force: true });
+      const bytes = await readFile(backup.file); bytes[bytes.length - 1] ^= 0x80;
+      const corrupt = path.join(ctx.base, 'corrupt.twcbak'); await writeFile(corrupt, bytes);
+      await assert.rejects(ctx.service.selectRestoreFile(async () => corrupt), /authenticate|integrity|backup/i);
+      const invalid = path.join(ctx.base, 'invalid.twcbak'); await writeFile(invalid, 'not a TWC backup');
+      await assert.rejects(ctx.service.selectRestoreFile(async () => invalid), /backup archive|format/i);
+    } finally { await ctx.service.stop(); await rm(ctx.base, { recursive: true, force: true }); }
+  });
+  it('rejects authenticated archives with invalid manifest paths', async () => {
+    const ctx = await setup();
+    try {
+      const settings = Buffer.from('{}');
+      const manifest = Buffer.from(JSON.stringify({ formatVersion: 1, appVersion: 'test', createdAt: new Date().toISOString(), files: [
+        { path: 'scheduler-data.json', present: true, size: settings.length, sha256: crypto.createHash('sha256').update(settings).digest('hex') },
+        { path: '../outside.exe', present: false, size: 0, sha256: null },
+      ] }));
+      const length = Buffer.alloc(4); length.writeUInt32BE(manifest.length);
+      const malicious = Buffer.concat([length, manifest, settings]);
+      const file = path.join(ctx.base, 'invalid-manifest.twcbak'); await writeFile(file, ctx.encodeArchive(malicious));
+      await assert.rejects(ctx.service.selectRestoreFile(async () => file), /invalid file entry|manifest/i);
+      assert.equal(await access(path.join(ctx.base, 'outside.exe')).then(() => true, () => false), false);
+    } finally { await ctx.service.stop(); await rm(ctx.base, { recursive: true, force: true }); }
+  });
+  it('rolls back an interrupted restore transaction during service initialization', async () => {
+    const ctx = await setup();
+    try {
+      const tx = path.join(ctx.userData, '.twc-restore-interrupted');
+      await mkdir(path.join(tx, 'rollback'), { recursive: true });
+      await writeFile(path.join(tx, 'rollback', 'scheduler-data.json'), JSON.stringify(ctx.saved));
+      await writeFile(path.join(tx, 'journal.json'), JSON.stringify({ version: 1, state: 'applying', entries: [{ relative: 'scheduler-data.json', existed: true }] }));
+      await writeFile(path.join(ctx.userData, 'scheduler-data.json'), '{"settings":{"pharmacyName":"partial"}}');
+      await ctx.service.initialize();
+      const restored = JSON.parse(await readFile(path.join(ctx.userData, 'scheduler-data.json'), 'utf8'));
+      assert.equal(restored.settings.pharmacyName, 'TWC Test');
+    } finally { await ctx.service.stop(); await rm(ctx.base, { recursive: true, force: true }); }
+  });
+  it('keeps only the configured number of recent verified backups', async () => {
+    const ctx = await setup();
+    try {
+      await ctx.service.updateSettings({ retention: 2 });
+      const first = await ctx.service.createBackup('manual', { force: true });
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await writeFile(path.join(ctx.userData, 'scheduler-data.json'), JSON.stringify({ ...ctx.saved, settings: { pharmacyName: 'second' } }));
+      const second = await ctx.service.createBackup('manual', { force: true });
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await writeFile(path.join(ctx.userData, 'scheduler-data.json'), JSON.stringify({ ...ctx.saved, settings: { pharmacyName: 'third' } }));
+      const third = await ctx.service.createBackup('manual', { force: true });
+      assert.equal(await access(first.file).then(() => true, () => false), false);
+      assert.equal(await access(second.file).then(() => true, () => false), true);
+      assert.equal(await access(third.file).then(() => true, () => false), true);
+    } finally { await ctx.service.stop(); await rm(ctx.base, { recursive: true, force: true }); }
+  });
+  it('applies weekly and daily automatic backup intervals without running early', async () => {
+    const ctx = await setup();
+    try {
+      await ctx.service.initialize();
+      const now = Date.now();
+      ctx.service.settings.enabled = true;
+      ctx.service.settings.frequency = 'weekly';
+      ctx.service.settings.lastSuccessfulAt = new Date(now - 6 * 24 * 60 * 60 * 1000).toISOString();
+      await ctx.service.checkAutomaticSchedule(now);
+      assert.equal(ctx.service.status().settings.history.length, 0);
+      ctx.service.settings.frequency = 'daily';
+      await ctx.service.checkAutomaticSchedule(now);
+      assert.equal(ctx.service.status().settings.history.filter(item => item.reasonType === 'automatic' && item.status === 'complete').length, 1);
+    } finally { await ctx.service.stop(); await rm(ctx.base, { recursive: true, force: true }); }
+  });
+  it('reports insufficient destination space and does not publish a valid backup', async () => {
+    const ctx = await setup(1024);
+    try {
+      await assert.rejects(ctx.service.createBackup('manual', { force: true }), /not have enough free disk space/);
+      assert.match(ctx.service.status().lastError, /not have enough free disk space/);
+      assert.equal(ctx.service.status().settings.history.at(-1).status, 'failed');
+      assert.equal((await readdir(ctx.destination)).some(name => name.endsWith('.twcbak')), false);
+    } finally { await ctx.service.stop(); await rm(ctx.base, { recursive: true, force: true }); }
+  });
+  it('does not mark a snapshot complete when configured announcement audio is missing', async () => {
+    const ctx = await setup();
+    try {
+      await rm(path.join(ctx.userData, 'announcements', `${audioId}.mp3`));
+      await assert.rejects(ctx.service.createBackup('manual', { force: true }), /audio file is missing/);
+      assert.equal(ctx.service.status().settings.history.at(-1).status, 'failed');
+    } finally { await ctx.service.stop(); await rm(ctx.base, { recursive: true, force: true }); }
+  });
+  it('cleans incomplete backup and plaintext verification temporary files after restart', async () => {
+    const ctx = await setup();
+    try {
+      const plaintextTemp = path.join(ctx.userData, '.twc-backup-verify-interrupted.tmp');
+      const archiveTemp = path.join(ctx.destination, 'unfinished.twcbak.tmp');
+      await writeFile(plaintextTemp, 'temporary decrypted verification bytes');
+      await writeFile(archiveTemp, 'unfinished encrypted archive');
+      await ctx.service.initialize();
+      assert.equal(await access(plaintextTemp).then(() => true, () => false), false);
+      assert.equal(await access(archiveTemp).then(() => true, () => false), false);
+    } finally { await ctx.service.stop(); await rm(ctx.base, { recursive: true, force: true }); }
+  });
+});
+
+describe('diagnostic credential redaction', () => {
+  it('redacts bearer tokens, OAuth codes, API keys, passwords, and common provider tokens', () => {
+    const raw = 'Authorization: Bearer spotify-access-token https://localhost/callback?code=oauth-code client_secret="google-secret" {"refresh_token":"spotify-refresh","api_key":"api-secret","password":"pw"} ghp_123456789012345678901234567890';
+    const cleaned = redactSecrets(raw);
+    for (const secret of ['spotify-access-token', 'oauth-code', 'google-secret', 'spotify-refresh', 'api-secret', 'pw', 'ghp_123456789012345678901234567890']) assert.equal(cleaned.includes(secret), false);
+    assert.match(cleaned, /Bearer \[REDACTED\]/);
+    assert.match(cleaned, /\[REDACTED\]/);
+    assert.doesNotMatch(redactSecrets('Could not read C:\\Users\\Jldems\\private\\settings.json'), /Jldems/);
+  });
+  it('allows only HTTPS links to approved Spotify help hosts', () => {
+    assert.equal(isApprovedExternalUrl('https://developer.spotify.com/policy'), true);
+    assert.equal(isApprovedExternalUrl('https://support.spotify.com/'), true);
+    for (const url of ['http://developer.spotify.com/', 'https://developer.spotify.com.evil.test/', 'https://user@developer.spotify.com/', 'https://developer.spotify.com:8443/', 'javascript:alert(1)']) assert.equal(isApprovedExternalUrl(url), false);
+  });
+  it('rejects IPC unless the sender is the app window, top frame, and trusted page', () => {
+    const valid = { senderIsApplicationWindow: true, senderIsTopFrame: true, urlIsTrusted: true };
+    assert.equal(isTrustedIpcRequest(valid), true);
+    for (const change of [{ senderIsApplicationWindow: false }, { senderIsTopFrame: false }, { urlIsTrusted: false }]) assert.equal(isTrustedIpcRequest({ ...valid, ...change }), false);
+  });
+});
+
+describe('main-process announcement service', () => {
+  const at = new Date(2026, 10, 18, 9, 0, 0);
+  const schedule = (id = 'schedule-1', start = '09:00') => ({ id, name: id, enabled: true, days: [['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][at.getDay()]], start, end: '10:00', firstAnnouncementId: 'audio-1', secondAnnouncementId: 'audio-2' });
+  const setup = async (schedules = [schedule()], announcements = [{ id: 'audio-1', enabled: true }, { id: 'audio-2', enabled: true }], execute = async () => {}, playback = async () => ({ is_playing: false })) => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-announcement-service-'));
+    const calls = { executed: [], paused: 0, resumed: 0, logs: [] };
+    const service = new AnnouncementService({
+      stateFile: path.join(dir, 'runs.json'), getStore: async () => ({ schedules, announcements }),
+      playback, pause: async () => { calls.paused++; return true; }, resume: async () => { calls.resumed++; },
+      execute: async (event, audio, options) => { calls.executed.push({ event, audio, options }); await execute(event, audio, options); },
+      log: async (level, message) => calls.logs.push({ level, message }),
+    });
+    return { dir, calls, service };
+  };
+  it('runs an exact occurrence once across duplicate timer triggers and persists completion', async () => {
+    const { dir, calls, service } = await setup();
+    try {
+      await Promise.all([service.tick('startup', at), service.tick('timer', at)]);
+      await service.tick('timer', at);
+      assert.equal(calls.executed.length, 1);
+      assert.equal(service.status().last.status, 'completed');
+      const saved = JSON.parse(await readFile(path.join(dir, 'runs.json'), 'utf8'));
+      assert.equal(saved.runs[0].status, 'completed');
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('skips colliding events and does not catch up after the scheduled minute', async () => {
+    const { dir, calls, service } = await setup([schedule(), schedule('schedule-2')]);
+    try {
+      await service.tick('timer', at);
+      assert.equal(calls.executed.length, 1);
+      assert.equal(service.status().last.status, 'skipped');
+      await service.tick('resume', new Date(at.getTime() + 60_000));
+      assert.equal(calls.executed.length, 1);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('marks an interrupted persisted occurrence failed and never replays it', async () => {
+    const { dir, calls, service } = await setup();
+    try {
+      const event = announcementEventsAt([schedule()], at)[0];
+      await writeFile(path.join(dir, 'runs.json'), JSON.stringify({ version: 1, windowWasPlaying: false, windowActive: false, runs: [{ key: event.key, scheduleId: event.schedule.id, scheduleName: event.schedule.name, audioId: event.audioId, boundary: event.boundary, status: 'running', attempts: 1, updatedAt: at.toISOString() }] }));
+      await service.tick('startup', at);
+      assert.equal(calls.executed.length, 0);
+      assert.equal(service.status().last.status, 'failed');
+      assert.match(service.status().last.reason, /not replayed/);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('records missing audio as a failure without attempting playback', async () => {
+    const { dir, calls, service } = await setup([schedule()], []);
+    try {
+      await service.tick('timer', at);
+      assert.equal(calls.executed.length, 0);
+      assert.equal(service.status().last.status, 'failed');
+      assert.match(service.status().last.reason, /missing or disabled/);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('waits for an active announcement to finish before clean shutdown', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-announcement-stop-'));
+    let release, started, stopped = false;
+    const began = new Promise(resolve => { started = resolve; });
+    const { calls, service } = await setup([schedule()], undefined, async () => { started(); await new Promise(resolve => { release = resolve; }); });
+    try {
+      const tick = service.tick('startup', at);
+      await began;
+      const stop = service.stop().then(() => { stopped = true; });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      assert.equal(stopped, false);
+      release();
+      await Promise.all([tick, stop]);
+      assert.equal(stopped, true);
+      assert.equal(calls.executed.length, 1);
+      assert.equal(service.status().last.status, 'completed');
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('pauses Spotify across a weekly announcement window and resumes after its end event', async () => {
+    const item = { ...schedule(), end: '09:01' };
+    const { dir, calls, service } = await setup([item], undefined, undefined, async () => ({ is_playing: true }));
+    try {
+      await service.tick('timer', at);
+      await service.tick('timer', new Date(at.getTime() + 60_000));
+      assert.equal(calls.paused, 1);
+      assert.equal(calls.resumed, 1);
+      assert.equal(calls.executed.length, 2);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+});
 
 describe('advertisement schedule configuration', () => {
   const weekly = { id: '12345678-1234-4123-8123-123456789012', name: 'Weekday rotation', type: 'weekly', days: ['Mon', 'Tue'], start: '09:00', end: '17:00', times: ['10:00', '15:00'], advertisementIds: ['87654321-4321-4123-8123-210987654321'], rotate: false, enabled: true };
@@ -103,6 +375,11 @@ describe('recurring announcement schedules', () => {
     const leap = { ...annual, date: '2024-02-29' };
     assert.equal(announcementEventsAt([leap], new Date(2025, 1, 28, 10, 58)).length, 0);
     assert.equal(announcementEventsAt([leap], new Date(2028, 1, 29, 10, 58)).length, 1);
+  });
+  it('only returns announcement events in the current minute, so sleep gaps do not replay expired audio', () => {
+    const schedule = { id: 'minute-only', name: 'Opening', days: ['Fri'], start: '12:00', end: '13:00', firstAnnouncementId: 'first', secondAnnouncementId: 'second', enabled: true };
+    assert.equal(unexpiredAnnouncementEvents([schedule], new Date(2026, 9, 23, 12, 0, 50)).length, 1);
+    assert.equal(unexpiredAnnouncementEvents([schedule], new Date(2026, 9, 23, 12, 1, 0)).length, 0);
   });
 });
 import { parseSecureToken } from '../dist-electron/spotify-token.js';
@@ -460,9 +737,9 @@ describe('local scheduled action display', () => {
       coordinator.stop();
       await coordinator.tick('wake');
       assert.deepEqual(executed, ['special']);
-      assert.ok(logs.some(message => message.includes('succeeded') && message.includes('special')));
+      assert.ok(logs.some(message => message.includes('completed') && message.includes('special')));
       const ledger = JSON.parse(await (await import('node:fs/promises')).readFile(opts.stateFile, 'utf8'));
-      assert.equal(Object.values(ledger.events)[0].status, 'succeeded');
+      assert.equal(Object.values(ledger.events)[0].status, 'completed');
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
   it('records a failed execution without reporting success or replaying it on restart', async () => {
@@ -511,6 +788,190 @@ describe('local scheduled action display', () => {
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
 });
+describe('scheduler missed-event and crash recovery', () => {
+  const at = (hour, minute, second = 0) => new Date(2026, 9, 23, hour, minute, second);
+  const optsFor = (dir, now, schedules, extras = {}) => ({
+    stateFile: path.join(dir, 'runs.json'),
+    now: () => now,
+    getSchedules: async () => ({ settings: { schedulerEnabled: true, missedSchedulePolicy: 'skip' }, schedules, ...extras }),
+    execute: async () => {}, recoverQuiet: async () => {}, enforceQuiet: async () => false, log: async () => {}, wait: async () => {},
+  });
+  it('enumerates missed local-time boundaries including overnight ends', () => {
+    const overnight = { ...s('overnight-recovery', ['Fri'], '23:00', '01:00'), quiet: true };
+    const events = schedulerBoundariesBetween([overnight], at(23, 59), new Date(2026, 9, 24, 1, 1));
+    assert.deepEqual(events.map(event => event.boundary), ['end']);
+    assert.match(events[0].key, /2026-10-24:01:00$/);
+  });
+  it('recovers only the latest recent missed music start when configured and skips its older overlap', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-missed-latest-'));
+    const schedules = [
+      { ...s('older', ['Fri'], '12:00', '13:00'), name: 'Older', playlistId: 'older-playlist' },
+      { ...s('latest', ['Fri'], '12:01', '13:01'), name: 'Latest', playlistId: 'latest-playlist' },
+    ];
+    const executed = [];
+    const opts = { ...optsFor(dir, at(12, 2, 30), schedules), getSchedules: async () => ({ settings: { schedulerEnabled: true, missedSchedulePolicy: 'latest-within-5-minutes' }, schedules }) };
+    opts.execute = async event => executed.push(event.schedule.id);
+    try {
+      await new ScheduleCoordinator(opts).tick('startup');
+      const ledger = JSON.parse(await readFile(opts.stateFile, 'utf8'));
+      assert.deepEqual(executed, ['latest']);
+      assert.equal(ledger.events['latest:start:2026-10-23:12:01'].status, 'completed');
+      assert.equal(ledger.events['older:start:2026-10-23:12:00'].status, 'skipped');
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('skips recent missed starts under the default recovery policy', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-missed-default-'));
+    const schedule = { ...s('default-skip', ['Fri'], '12:01', '13:01'), playlistId: 'playlist' };
+    let attempts = 0;
+    try {
+      await new ScheduleCoordinator(optsFor(dir, at(12, 2), [schedule])).tick('wake');
+      const ledger = JSON.parse(await readFile(path.join(dir, 'runs.json'), 'utf8'));
+      assert.equal(attempts, 0);
+      assert.equal(ledger.events['default-skip:start:2026-10-23:12:01'].status, 'skipped');
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('skips an expired missed start even when latest-within-five-minutes is selected', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-missed-expired-'));
+    const schedule = { ...s('expired', ['Fri'], '11:56', '12:30'), name: 'Expired', playlistId: 'playlist' };
+    const executed = [];
+    const opts = { ...optsFor(dir, at(12, 2), [schedule]), getSchedules: async () => ({ settings: { schedulerEnabled: true, missedSchedulePolicy: 'latest-within-5-minutes' }, schedules: [schedule] }) };
+    opts.execute = async event => executed.push(event.schedule.id);
+    try {
+      await writeFile(opts.stateFile, JSON.stringify({ version: 3, meta: { lastObservedAt: at(11, 50).toISOString() }, events: {} }));
+      await new ScheduleCoordinator(opts).tick('startup');
+      const ledger = JSON.parse(await readFile(opts.stateFile, 'utf8'));
+      assert.deepEqual(executed, []);
+      assert.equal(ledger.events['expired:start:2026-10-23:11:56'].status, 'skipped');
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('retries a transient Spotify failure a bounded number of times and records completion', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-scheduler-retry-'));
+    const schedule = { ...s('retry', ['Fri'], '12:00', '13:00'), name: 'Retry', playlistId: 'playlist' };
+    let attempts = 0;
+    const opts = optsFor(dir, at(12, 0), [schedule]);
+    opts.execute = async () => { attempts++; if (attempts < 2) throw new Error('Spotify network request failed (PUT /me/player/play): offline'); };
+    try {
+      await new ScheduleCoordinator(opts).tick();
+      const ledger = JSON.parse(await readFile(opts.stateFile, 'utf8'));
+      assert.equal(attempts, 2);
+      assert.equal(ledger.events['retry:start:2026-10-23:12:00'].status, 'completed');
+      assert.equal(ledger.events['retry:start:2026-10-23:12:00'].attempts, 2);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('retries a temporarily missing Spotify device but keeps the retry count bounded', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-scheduler-device-retry-'));
+    const schedule = { ...s('device-retry', ['Fri'], '12:00', '13:00'), playlistId: 'playlist' };
+    let attempts = 0;
+    const opts = optsFor(dir, at(12, 0), [schedule]);
+    opts.execute = async () => { attempts++; if (attempts === 1) throw new Error('Spotify returned no available controllable playback device.'); };
+    try {
+      await new ScheduleCoordinator(opts).tick();
+      const ledger = JSON.parse(await readFile(opts.stateFile, 'utf8'));
+      assert.equal(attempts, 2);
+      assert.equal(ledger.events['device-retry:start:2026-10-23:12:00'].status, 'completed');
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('records an intentional skip separately from a completed Spotify operation', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-scheduler-skipped-'));
+    const schedule = { ...s('intentional-skip', ['Fri'], '12:00', '13:00'), playlistId: 'playlist' };
+    const opts = optsFor(dir, at(12, 0), [schedule]);
+    opts.execute = async () => ({ skipped: 'Quiet Hours are still active.' });
+    try {
+      await new ScheduleCoordinator(opts).tick();
+      const ledger = JSON.parse(await readFile(opts.stateFile, 'utf8'));
+      assert.equal(ledger.events['intentional-skip:start:2026-10-23:12:00'].status, 'skipped');
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('stops retrying after three transient failures and does not retry on later wake ticks', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-scheduler-retry-limit-'));
+    const schedule = { ...s('retry-limit', ['Fri'], '12:00', '13:00'), playlistId: 'playlist' };
+    let attempts = 0;
+    const opts = optsFor(dir, at(12, 0), [schedule]);
+    opts.execute = async () => { attempts++; throw new Error('Spotify request failed (503)'); };
+    try {
+      const coordinator = new ScheduleCoordinator(opts);
+      await coordinator.tick();
+      await coordinator.tick('wake');
+      const ledger = JSON.parse(await readFile(opts.stateFile, 'utf8'));
+      assert.equal(attempts, 3);
+      assert.equal(ledger.events['retry-limit:start:2026-10-23:12:00'].status, 'failed');
+      assert.equal(ledger.events['retry-limit:start:2026-10-23:12:00'].attempts, 3);
+      assert.equal(ledger.events['retry-limit:start:2026-10-23:12:00'].retryable, false);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('recovers a persisted running event after a simulated crash', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-scheduler-crash-'));
+    const schedule = { ...s('crashed', ['Fri'], '12:00', '13:00'), name: 'Crashed', playlistId: 'playlist' };
+    let attempts = 0;
+    const opts = optsFor(dir, at(12, 1, 30), [schedule]);
+    opts.execute = async () => { attempts++; };
+    try {
+      await writeFile(opts.stateFile, JSON.stringify({ version: 3, meta: { lastObservedAt: at(11, 59).toISOString() }, events: { 'crashed:start:2026-10-23:12:00': { status: 'running', attempts: 1, updatedAt: at(12, 0).toISOString() } } }));
+      await new ScheduleCoordinator(opts).tick('startup');
+      const ledger = JSON.parse(await readFile(opts.stateFile, 'utf8'));
+      assert.equal(attempts, 1);
+      assert.equal(ledger.events['crashed:start:2026-10-23:12:00'].status, 'completed');
+      assert.equal(ledger.events['crashed:start:2026-10-23:12:00'].attempts, 2);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('queues overlapping wake triggers and executes an occurrence only once', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-scheduler-overlap-'));
+    const schedule = { ...s('overlap', ['Fri'], '12:00', '13:00'), name: 'Overlap', playlistId: 'playlist' };
+    const opts = optsFor(dir, at(12, 0), [schedule]);
+    let attempts = 0, release, started;
+    const isStarted = new Promise(resolve => { started = resolve; });
+    opts.execute = async () => { attempts++; started(); await new Promise(resolve => { release = resolve; }); };
+    try {
+      const coordinator = new ScheduleCoordinator(opts);
+      const first = coordinator.tick('startup');
+      await isStarted;
+      const wake = coordinator.tick('wake');
+      release();
+      await Promise.all([first, wake]);
+      assert.equal(attempts, 1);
+      const ledger = JSON.parse(await readFile(opts.stateFile, 'utf8'));
+      assert.equal(ledger.events['overlap:start:2026-10-23:12:00'].status, 'completed');
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('waits for an in-flight operation during clean shutdown and records its outcome', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-scheduler-shutdown-'));
+    const schedule = { ...s('shutdown', ['Fri'], '12:00', '13:00'), playlistId: 'playlist' };
+    const opts = optsFor(dir, at(12, 0), [schedule]);
+    let release, started, stopped = false;
+    const isStarted = new Promise(resolve => { started = resolve; });
+    opts.execute = async () => { started(); await new Promise(resolve => { release = resolve; }); };
+    try {
+      const coordinator = new ScheduleCoordinator(opts);
+      const ticking = coordinator.tick();
+      await isStarted;
+      const stopping = coordinator.stop().then(() => { stopped = true; });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      assert.equal(stopped, false);
+      release();
+      await Promise.all([ticking, stopping]);
+      const ledger = JSON.parse(await readFile(opts.stateFile, 'utf8'));
+      assert.equal(stopped, true);
+      assert.equal(ledger.events['shutdown:start:2026-10-23:12:00'].status, 'completed');
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it('re-applies active Quiet Hours once after wake without replaying its missed music start', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-quiet-wake-'));
+    const schedule = { ...s('quiet-wake', ['Fri'], '10:00', '13:00'), quiet: true };
+    let recovered = 0, executed = 0;
+    const opts = optsFor(dir, at(11, 0), [schedule]);
+    opts.execute = async () => { executed++; };
+    opts.recoverQuiet = async () => { recovered++; };
+    try {
+      const coordinator = new ScheduleCoordinator(opts);
+      await coordinator.tick('wake');
+      await coordinator.tick('wake');
+      assert.equal(executed, 0);
+      assert.equal(recovered, 1);
+      const ledger = JSON.parse(await readFile(opts.stateFile, 'utf8'));
+      assert.equal(ledger.events['quiet-wake:quiet-recovery:2026-10-23'].status, 'completed');
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+});
 describe('quiet-hour playback restoration', () => {
   it('captures active playback context and seeks back to the prior track position', () => {
     const saved = captureQuietPlayback({ is_playing: true, context: { uri: 'spotify:playlist:p' }, item: { uri: 'spotify:track:t' }, progress_ms: 12345 });
@@ -535,6 +996,27 @@ describe('quiet-hour playback restoration', () => {
   });
 });
 describe('Spotify authorization and API errors', () => {
+  it('classifies authentication, network, missing device, and playback failures separately', () => {
+    assert.equal(classifySpotifyHealth({ authenticated: false }).state, 'disconnected');
+    assert.equal(classifySpotifyHealth({ authenticated: true, error: new Error('Spotify authorization expired. Reconnect Spotify.') }).state, 'authentication-required');
+    assert.equal(classifySpotifyHealth({ authenticated: true, error: new Error('Spotify network request failed: offline') }).state, 'reconnecting');
+    assert.equal(classifySpotifyHealth({ authenticated: true, error: new Error('Spotify request failed (403)') }).state, 'playback-error');
+    assert.equal(classifySpotifyHealth({ authenticated: true, devices: [] }).state, 'no-playback-device');
+    assert.equal(classifySpotifyHealth({ authenticated: true, devices: [{ id: 'secret-id', name: 'Desktop', is_active: true }] }).deviceKey, 'secret-id');
+  });
+  it('only recovers a confirmed unexpected stop inside an active scheduled music window', () => {
+    const base = { previouslyPlaying: true, currentlyPlaying: false, schedulerEnabled: true, quiet: false, announcementBusy: false, announcementWindowActive: false, activeMusicSchedule: true };
+    assert.equal(shouldRecoverUnexpectedStop(base), true);
+    for (const change of [{ previouslyPlaying: false }, { currentlyPlaying: true }, { schedulerEnabled: false }, { quiet: true }, { announcementBusy: true }, { announcementWindowActive: true }, { activeMusicSchedule: false }]) assert.equal(shouldRecoverUnexpectedStop({ ...base, ...change }), false);
+  });
+  it('retries safe temporary failures with bounded backoff and honors Retry-After', async () => {
+    let attempts = 0; const waits = [];
+    const response = await requestSpotifyApi({ method: 'PUT', endpoint: '/me/player/pause', getAccessToken: async () => 'x', refreshAccessToken: async () => 'y', wait: async ms => waits.push(ms), fetcher: async () => ++attempts === 1 ? new Response('slow down', { status: 429, headers: { 'Retry-After': '2' } }) : new Response(null, { status: 204 }) });
+    assert.equal(response, null); assert.equal(attempts, 2); assert.deepEqual(waits, [2000]);
+    attempts = 0; waits.length = 0;
+    await assert.rejects(requestSpotifyApi({ method: 'POST', endpoint: '/me/player/next', getAccessToken: async () => 'x', refreshAccessToken: async () => 'y', wait: async ms => waits.push(ms), fetcher: async () => { attempts++; return new Response('unavailable', { status: 503 }); } }), /503/);
+    assert.equal(attempts, 1); assert.equal(waits.length, 0);
+  });
   it('polls device activation after transfer instead of failing on the first inactive response', async () => {
     const playlistId = 'ABCDEFGHIJKLMNOPQRSTUV'; let deviceReads = 0; let stateReads = 0; let plays = 0;
     const result = await startScheduledPlayback({

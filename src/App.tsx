@@ -46,7 +46,6 @@ import {
   downloadBusinessHoursCsvTemplate,
 } from "./business-hours-csv.mjs";
 import {
-  announcementEventsAt,
   announcementWindowActive,
   validateAnnouncementSchedule,
   saveAnnouncementSchedule,
@@ -105,6 +104,7 @@ const seed = {
     schedulerEnabled: true,
     startWithWindows: false,
     startMinimizedToTray: false,
+    missedSchedulePolicy: "skip",
   },
   schedules: [] as Schedule[],
   exceptions: [] as any[],
@@ -130,6 +130,8 @@ export default function App() {
     [data, setData] = useState<any>(seed),
     [branding, setBranding] = useState<any>({ pharmacyName: "TWC Stafford", pharmacyLogo: "", pharmacyIcon: "", version: "" }),
     [updateStatus, setUpdateStatus] = useState<any>({ status: "idle", currentVersion: "…", message: "Loading update status…" }),
+    [backupStatus, setBackupStatus] = useState<any>(null),
+    [restoreBackupPreview, setRestoreBackupPreview] = useState<any>(null),
     [spotify, setSpotify] = useState<any>({
       connected: false,
       message: "Checking...",
@@ -174,8 +176,48 @@ export default function App() {
       active: false,
     },
   );
-  const announcementClaimed = useRef(new Set<string>());
-  const announcementLastTick = useRef<Date | null>(null);
+  useEffect(() => {
+    const editableTextSelector = [
+      'input:not([type])',
+      'input[type="text"]',
+      'input[type="search"]',
+      'input[type="email"]',
+      'input[type="url"]',
+      'input[type="tel"]',
+      "textarea",
+      '[contenteditable]:not([contenteditable="false"])',
+    ].join(",");
+    const applyAustralianSpellcheck = (root: ParentNode) => {
+      if (root instanceof Element && root.matches(editableTextSelector)) {
+        root.setAttribute("spellcheck", "true");
+        root.setAttribute("lang", "en-AU");
+      }
+      root.querySelectorAll(editableTextSelector).forEach((field) => {
+        field.setAttribute("spellcheck", "true");
+        field.setAttribute("lang", "en-AU");
+      });
+    };
+
+    document.documentElement.lang = "en-AU";
+    applyAustralianSpellcheck(document.body);
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        record.addedNodes.forEach((node) => {
+          if (node instanceof Element) applyAustralianSpellcheck(node);
+        });
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, []);
+  const [announcementServiceStatus, setAnnouncementServiceStatus] = useState<any>({ running: false, busy: false, active: null, last: null, error: null });
+  useEffect(() => {
+    let live = true;
+    const apply = (status: any) => { if (live) setAnnouncementServiceStatus(status); };
+    void window.twc.announcementsStatus().then(apply).catch((error) => apply({ running: false, busy: false, active: null, last: null, error: String(error) }));
+    const unsubscribe = window.twc.onAnnouncementsStatus(apply);
+    return () => { live = false; unsubscribe(); };
+  }, []);
   const [googleLocations, setGoogleLocations] = useState<any[]>([]),
     [googleHours, setGoogleHours] = useState<any>(null),
     [googleHoursSource, setGoogleHoursSource] = useState<any>(null),
@@ -260,11 +302,30 @@ export default function App() {
   const logAdvertisementTest = (level: string, message: string) => {
     void window.twc.log(level, `Advertisement: ${message}`).catch(() => undefined);
   };
+  async function confirmedSpotifyAction(action: "play" | "pause") {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const before = await window.twc.spotifyPlayback();
+        if (action === "pause" ? !before?.is_playing : !!before?.is_playing) return;
+        await window.twc.spotifyControl(action);
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        const after = await window.twc.spotifyPlayback();
+        if (action === "pause" ? !after?.is_playing : !!after?.is_playing) return;
+        lastError = new Error(`Spotify did not confirm the ${action} command.`);
+      } catch (error) {
+        lastError = error;
+        if (!/network request failed|request timed out|\(429\)|\(5\d\d\)|did not confirm/i.test(String(error))) throw error;
+      }
+      if (attempt < 3) await new Promise((resolve) => window.setTimeout(resolve, attempt * 750));
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError || `Spotify ${action} command failed.`));
+  }
   function restoreSpotifyAfterAdvertisement() {
     const shouldResume = advertisementPlaybackWasPlaying.current;
     advertisementPlaybackWasPlaying.current = false;
     if (!shouldResume) return;
-    void window.twc.spotifyControl("play").catch((error: any) => {
+    void confirmedSpotifyAction("play").catch((error: any) => {
       notify(`Advertisement finished, but Spotify could not be resumed: ${String(error).replace(/^Error: /, "")}`);
     });
   }
@@ -302,7 +363,7 @@ export default function App() {
         const state = await window.twc.spotifyPlayback();
         if (!isCurrent()) return false;
         advertisementPlaybackWasPlaying.current = state?.is_playing === true;
-        if (state?.is_playing) await window.twc.spotifyControl("pause");
+        if (state?.is_playing) await confirmedSpotifyAction("pause");
       }
       if (!isCurrent()) {
         restoreSpotifyAfterAdvertisement();
@@ -421,6 +482,9 @@ export default function App() {
     setToast(s);
     window.setTimeout(() => setToast(""), 4500);
   };
+  useEffect(() => {
+    if (announcementServiceStatus.error) notify(announcementServiceStatus.error);
+  }, [announcementServiceStatus.error]);
   function restoreSpotifyAfterAnnouncement() {
     const shouldResume = announcementPlayback.current.wasPlaying;
     canceledTestStartup.current = false;
@@ -431,8 +495,7 @@ export default function App() {
     }
     const generation = announcementGeneration.current;
     let pending: Promise<void>;
-    pending = window.twc
-      .spotifyControl("play")
+    pending = confirmedSpotifyAction("play")
       .then(() => {
         if (announcementGeneration.current === generation) {
           announcementPlayback.current.wasPlaying = false;
@@ -541,7 +604,7 @@ export default function App() {
           if (announcementPlayback.current.wasPlaying)
             localStorage.setItem("twc-announcement-window-was-playing", "1");
         }
-        if (state?.is_playing) await window.twc.spotifyControl("pause");
+        if (state?.is_playing) await confirmedSpotifyAction("pause");
       }
       if (generation !== announcementGeneration.current) {
         restoreCanceledTest();
@@ -624,116 +687,6 @@ export default function App() {
     await persist(next);
   }
   useEffect(() => {
-    const tick = () => {
-      const schedules = data.announcementSchedules || [],
-        now = new Date();
-      if (
-        announcementWindowActive(schedules, now) &&
-        !announcementPlayback.current.active
-      )
-        void window.twc
-          .spotifyPlayback()
-          .then((state: any) => {
-            if (state?.is_playing) {
-              announcementPlayback.current.wasPlaying = true;
-              return window.twc.spotifyControl("pause");
-            }
-          })
-          .catch(() => undefined);
-      const firstMinute = announcementLastTick.current
-        ? new Date(
-            announcementLastTick.current.getFullYear(),
-            announcementLastTick.current.getMonth(),
-            announcementLastTick.current.getDate(),
-            announcementLastTick.current.getHours(),
-            announcementLastTick.current.getMinutes() + 1,
-          )
-        : now;
-      const due: any[] = [];
-      for (
-        let cursor = firstMinute;
-        cursor <= now;
-        cursor = new Date(
-          cursor.getFullYear(),
-          cursor.getMonth(),
-          cursor.getDate(),
-          cursor.getHours(),
-          cursor.getMinutes() + 1,
-        )
-      )
-        due.push(...announcementEventsAt(schedules, cursor));
-      announcementLastTick.current = now;
-      for (const event of due) {
-        if (
-          announcementClaimed.current.has(event.key) ||
-          localStorage.getItem(`twc-announcement:${event.key}`)
-        )
-          continue;
-        announcementClaimed.current.add(event.key);
-        localStorage.setItem(`twc-announcement:${event.key}`, "1");
-        const id =
-          event.audioId ||
-          (event.boundary === "start"
-            ? event.schedule.firstAnnouncementId
-            : event.schedule.secondAnnouncementId);
-        const audio = (data.announcements || []).find(
-          (a: any) => a.id === id && a.enabled,
-        );
-        if (!audio) {
-          void window.twc.log(
-            "error",
-            `Scheduled ${event.boundary} announcement audio is missing or disabled for "${event.schedule.name}".`,
-          );
-          if (
-            event.boundary === "end" &&
-            announcementPlayback.current.wasPlaying
-          ) {
-            void window.twc.spotifyControl("play").catch(() => undefined);
-            announcementPlayback.current.wasPlaying = false;
-            localStorage.removeItem("twc-announcement-window-was-playing");
-          }
-          continue;
-        }
-        if (event.boundary === "end")
-          announcementPlayback.current.active = false;
-        void playAnnouncement(
-          audio.id,
-          !!event.custom || event.boundary === "end",
-          event.boundary === "end",
-          "scheduled",
-        );
-      }
-    };
-    const now = new Date();
-    if (announcementWindowActive(data.announcementSchedules || [], now)) {
-      void window.twc
-        .spotifyPlayback()
-        .then((state: any) => {
-          if (state?.is_playing) {
-            announcementPlayback.current.wasPlaying = true;
-            return window.twc.spotifyControl("pause");
-          }
-        })
-        .catch(() => undefined);
-    } else if (announcementPlayback.current.wasPlaying) {
-      void window.twc
-        .spotifyControl("play")
-        .then(() => {
-          announcementPlayback.current.wasPlaying = false;
-          localStorage.removeItem("twc-announcement-window-was-playing");
-        })
-        .catch((error: any) => {
-          void window.twc.log(
-            "error",
-            `Could not recover Spotify after an announcement window: ${String(error)}`,
-          );
-        });
-    }
-    tick();
-    const timer = window.setInterval(tick, 1000);
-    return () => window.clearInterval(timer);
-  }, [data.announcementSchedules, data.announcements, spotify.connected]);
-  useEffect(() => {
     const randomKey = (scheduleId: string) => `twc-advertisement-random-next:${scheduleId}`;
     const randomMinutes = (schedule: any) => Math.floor(Math.random() * (schedule.maxIntervalMinutes - schedule.minIntervalMinutes + 1)) + schedule.minIntervalMinutes;
     const dayIndex = (date: Date) => (date.getDay() + 6) % 7;
@@ -778,6 +731,12 @@ export default function App() {
           }
           due = now.getTime() >= nextAt;
           if (due) {
+            if (now.getTime() - nextAt > 60_000) {
+              const next = now.getTime() + randomMinutes(schedule) * 60_000;
+              localStorage.setItem(storageKey, String(next));
+              void window.twc.log("warn", `Skipped an expired random advertisement occurrence for "${schedule.name}" after a clock gap or sleep; the next occurrence is scheduled normally.`);
+              continue;
+            }
             occurrenceKey = `${schedule.id}:${Math.floor(nextAt / 60_000)}`;
             localStorage.setItem(storageKey, String(now.getTime() + randomMinutes(schedule) * 60_000));
           }
@@ -904,12 +863,22 @@ export default function App() {
       window.removeEventListener("unhandledrejection", reportRejectedPromise);
     };
   }, []);
+  useEffect(() => window.twc.onSpotifyHealth((status: any) => {
+    setSpotify((current: any) => ({ ...current, ...status }));
+    if (status.state === "authentication-required" || status.state === "no-playback-device") setPlaybackError(status.message);
+  }), []);
   useEffect(() => window.twc.onSpotifyPlaybackStage(setPlaybackStage), []);
   useEffect(() => {
     const unsubscribe = window.twc.onUpdaterStatus(setUpdateStatus);
     void window.twc.updaterStatus().then(setUpdateStatus).catch(() => undefined);
     return unsubscribe;
   }, []);
+  useEffect(() => {
+    const unsubscribe = window.twc.onBackupStatus(setBackupStatus);
+    void window.twc.backupStatus().then((status) => { if (status) setBackupStatus(status); else notify("Backup service is unavailable."); }).catch((error) => notify(`Backup service unavailable: ${String(error).replace(/^Error: /, "")}`));
+    return unsubscribe;
+  }, []);
+  useEffect(() => { if (backupStatus?.lastError) notify(`Backup issue: ${backupStatus.lastError}`); }, [backupStatus?.lastError]);
   useEffect(() => {
     if (["checking", "current", "available", "downloaded", "error"].includes(updateStatus.status)) notify(updateStatus.message);
     else if (updateStatus.status === "downloading" && updateStatus.percent > 0 && updateStatus.percent % 10 === 0) notify(updateStatus.message);
@@ -1547,7 +1516,7 @@ export default function App() {
           <span>Music for a better space.</span>
         </div>
       </aside>
-      <main className="main" spellCheck={true}>
+      <main className="main" lang="en-AU" spellCheck={true}>
         <div className="content">
           {page === "Home" && (
             <>
@@ -1568,11 +1537,11 @@ export default function App() {
                     color={spotify.connected ? "#13bd57" : "#ef4444"}
                   />
                   <div>
-                    <b>{spotify.connected ? "Connected" : "Not connected"}</b>
+                    <b>{({ connected: "Connected", disconnected: "Disconnected", reconnecting: "Reconnecting", "authentication-required": "Authentication Required", "no-playback-device": "No Playback Device", "playback-error": "Playback Error" } as any)[spotify.state] || (spotify.connected ? "Connected" : "Disconnected")}</b>
                     <span>
-                      {spotify.connected
-                        ? `Spotify account  |  ${spotify.name}`
-                        : spotify.message}
+                      {spotify.state === "no-playback-device" || !spotify.connected
+                        ? (spotify.recoveryMessage || spotify.message)
+                        : `Spotify account  |  ${spotify.name || "Connected"}`}
                     </span>
                   </div>
                   <img
@@ -2603,6 +2572,17 @@ export default function App() {
                   </div>
                   <div className="panel">
                     <h3>Announcement schedules</h3>
+                    <p role="status" aria-live="polite">
+                      {announcementServiceStatus.error
+                        ? `Announcement service issue: ${announcementServiceStatus.error}`
+                        : announcementServiceStatus.active
+                          ? `Playing scheduled announcement (${announcementServiceStatus.active}).`
+                          : announcementServiceStatus.last
+                            ? `Last announcement: ${announcementServiceStatus.last.status}${announcementServiceStatus.last.reason ? ` — ${announcementServiceStatus.last.reason}` : ""}`
+                            : announcementServiceStatus.running
+                              ? "Announcement service is running."
+                              : "Announcement service is starting."}
+                    </p>
                     {(data.announcementSchedules || []).map((s: any) => {
                       const first = (data.announcements || []).find(
                         (a: any) =>
@@ -3310,7 +3290,86 @@ export default function App() {
                 </div>
                )}
               {settingsTab === "general" && (
-                <div id="settings-panel-general" role="tabpanel" aria-labelledby="settings-tab-general" className="settings-tab-panel">
+                <div id="settings-panel-general-backups" role="group" aria-labelledby="settings-tab-general" className="settings-tab-panel general-settings-panel">
+                  <div className="panel form-panel">
+                    <h3>Transfer Settings</h3>
+                    <p>Move application settings, schedules, and saved playlist configuration to another PC. Connection tokens and local branding files are not included.</p>
+                    <div className="form-inline">
+                      <button className="subtle" onClick={async () => {
+                        try {
+                          const store = await window.twc.load();
+                          const { pharmacyLogo: _logo, pharmacyIcon: _icon, ...portableSettings } = store.settings || {};
+                          const payload = { format: "twc-spotify-scheduler-settings", version: 1, exportedAt: new Date().toISOString(), data: { settings: portableSettings, schedules: store.schedules || [], exceptions: store.exceptions || [], playlists: store.playlists || [] } };
+                          const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
+                          const link = document.createElement("a"); link.href = url; link.download = "twc-spotify-scheduler-settings.json"; link.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+                          notify("Settings exported successfully.");
+                        } catch (error) { notify(`Export failed: ${String(error).replace(/^Error: /, "")}`); }
+                      }}>Export Settings</button>
+                      <button className="primary" onClick={() => document.getElementById("import-settings-file")?.click()}>Import Settings</button>
+                      <input id="import-settings-file" type="file" accept=".json,application/json" style={{ display: "none" }} onChange={async (event) => {
+                          const file = event.target.files?.[0]; event.target.value = ""; if (!file) return;
+                          try {
+                            if (file.size > 10 * 1024 * 1024) throw new Error("The settings file is too large.");
+                            const payload = JSON.parse(await file.text());
+                            if (!payload || payload.format !== "twc-spotify-scheduler-settings" || payload.version !== 1 || !payload.data || typeof payload.data !== "object" || !payload.data.settings || !Array.isArray(payload.data.schedules) || !Array.isArray(payload.data.exceptions) || !Array.isArray(payload.data.playlists)) throw new Error("This is not a supported TWC Scheduler settings export.");
+                            await window.twc.validateSettingsImport(payload.data);
+                            if (!window.confirm("Import and apply these settings? Existing application settings, schedules and playlist configuration will be overwritten.")) return;
+                            await window.twc.save(payload.data);
+                            setData(await window.twc.load());
+                            notify("Settings imported successfully.");
+                          } catch (error) { notify(`Import failed: ${String(error).replace(/^Error: /, "")}`); }
+                        }} />
+                    </div>
+                    <small>Imported files are validated before they are saved. Settings files work across PCs running a compatible version of the application.</small>
+                  </div>
+                  <div className="panel form-panel">
+                    <h3>Automatic Backup &amp; Restore</h3>
+                    <p>Backups are encrypted and include application settings, music and announcement schedules, execution history, Quiet Hours playback state, branding, announcement and advertisement audio, and encrypted account connection files. Diagnostic logs and temporary files are excluded.</p>
+                    <label className="checkline">
+                      <input type="checkbox" checked={!!backupStatus?.settings?.enabled} disabled={!backupStatus || backupStatus.busy} onChange={async (event) => { try { setBackupStatus(await window.twc.backupUpdateSettings({ enabled: event.target.checked })); } catch (error) { notify(String(error).replace(/^Error: /, "")); } }} />
+                      Enable automatic backups
+                    </label>
+                    <label htmlFor="backup-frequency">Backup frequency</label>
+                    <select id="backup-frequency" value={backupStatus?.settings?.frequency || "daily"} disabled={!backupStatus || backupStatus.busy} onChange={async (event) => { try { setBackupStatus(await window.twc.backupUpdateSettings({ frequency: event.target.value })); } catch (error) { notify(String(error).replace(/^Error: /, "")); } }}>
+                      <option value="daily">Daily</option><option value="weekly">Weekly</option>
+                    </select>
+                    <label htmlFor="backup-retention">Keep recent backups</label>
+                    <select id="backup-retention" value={backupStatus?.settings?.retention || 10} disabled={!backupStatus || backupStatus.busy} onChange={async (event) => { try { setBackupStatus(await window.twc.backupUpdateSettings({ retention: Number(event.target.value) })); } catch (error) { notify(String(error).replace(/^Error: /, "")); } }}>
+                      {[3, 5, 10, 20, 50].map(count => <option key={count} value={count}>{count} backups</option>)}
+                    </select>
+                    <div className="setting-readonly"><b>Backup folder</b><span>{backupStatus?.settings?.destination || "Loading…"}</span></div>
+                    <div className="form-inline">
+                      <button className="subtle" disabled={!backupStatus || backupStatus.busy} onClick={async () => { try { const next = await window.twc.backupChooseDestination(); if (next) setBackupStatus(next); } catch (error) { notify(String(error).replace(/^Error: /, "")); } }}>Choose Folder</button>
+                      <button className="primary" disabled={!backupStatus || backupStatus.busy} onClick={async () => { try { const result = await window.twc.backupCreate(); if (result) notify("Backup completed successfully."); } catch (error) { notify(`Backup failed: ${String(error).replace(/^Error: /, "")}`); } }}>Create Backup Now</button>
+                      <button className="subtle" disabled={!backupStatus || backupStatus.busy} onClick={async () => { try { const preview = await window.twc.backupSelectRestore(); if (preview) setRestoreBackupPreview(preview); } catch (error) { notify(`Backup validation failed: ${String(error).replace(/^Error: /, "")}`); } }}>Select Backup to Restore</button>
+                    </div>
+                    {backupStatus?.progress && <><small role="status" aria-live="polite">{backupStatus.progress.message}</small><div className="update-progress" role="progressbar" aria-label="Backup operation progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={backupStatus.progress.percent}><span style={{ width: `${backupStatus.progress.percent}%` }} /></div></>}
+                    {backupStatus?.lastError && <small className="updater-error" role="alert">{backupStatus.lastError}</small>}
+                    {backupStatus?.settings?.lastSuccessfulAt && <small>Last successful backup: {new Date(backupStatus.settings.lastSuccessfulAt).toLocaleString()}</small>}
+                    {restoreBackupPreview && <div className="panel">
+                      <h4>Backup selected for restore</h4>
+                      <p>Created {new Date(restoreBackupPreview.createdAt).toLocaleString()} · Version {restoreBackupPreview.appVersion} · {(restoreBackupPreview.totalBytes / (1024 * 1024)).toFixed(1)} MB · {restoreBackupPreview.fileCount} files</p>
+                      <p>Includes: {restoreBackupPreview.categories.join(", ")}</p>
+                      <div className="form-inline">
+                        <button className="primary" disabled={backupStatus?.busy} onClick={async () => {
+                          const approved = window.confirm("Restore this backup? Current application data will first be saved as a safety backup. The application will restart after the restore.");
+                          if (!approved) return;
+                          try { await window.twc.backupRestore(restoreBackupPreview.token); setRestoreBackupPreview(null); notify("Restore completed. Restarting the application…"); }
+                          catch (error) { notify(`Restore failed: ${String(error).replace(/^Error: /, "")}`); }
+                        }}>Restore and Restart</button>
+                        <button className="subtle" onClick={() => setRestoreBackupPreview(null)}>Cancel</button>
+                      </div>
+                    </div>}
+                  </div>
+                  <div className="panel">
+                    <h3>Backup History</h3>
+                    {(backupStatus?.settings?.history || []).length ? <div className="schedule-list">{[...backupStatus.settings.history].reverse().map((item: any, index: number) => <div className="schedule-row" key={`${item.file}-${index}`}><div className="schedule-name"><b>{new Date(item.createdAt).toLocaleString()} · {item.status === "complete" ? "Complete" : "Failed"}</b><span>{item.status === "complete" ? `${(item.size / (1024 * 1024)).toFixed(1)} MB · ${item.reasonType || "backup"}` : item.reason || "Backup did not finish"}</span></div></div>)}</div> : <p>No backups have been created yet.</p>}
+                    <small>Automatic backups are checked while the application is running, including when it is hidden in the system tray. A backup is also attempted before installing an application update.</small>
+                  </div>
+                </div>
+              )}
+              {settingsTab === "general" && (
+                <div id="settings-panel-general" role="tabpanel" aria-labelledby="settings-tab-general" className="settings-tab-panel general-settings-panel">
               <div className="panel form-panel">
                 <h3>Startup &amp; Application Behavior</h3>
                 <p>Choose how TWC Spotify Scheduler starts on this Windows computer.</p>
@@ -3324,6 +3383,12 @@ export default function App() {
                   Start Minimized to System Tray
                 </label>
                 <small>When launched at Windows sign-in, keep the main window hidden until you open it from the tray.</small>
+                <label htmlFor="missed-schedule-policy">Missed schedule recovery</label>
+                <select id="missed-schedule-policy" value={data.settings.missedSchedulePolicy || "skip"} onChange={(e) => updateSetting("missedSchedulePolicy", e.target.value)}>
+                  <option value="skip">Skip missed music starts</option>
+                  <option value="latest-within-5-minutes">Run only the latest start if no more than 5 minutes late</option>
+                </select>
+                <small>Older starts are always skipped. Missed announcements are never replayed.</small>
               </div>
               <div className="panel form-panel branding-panel">
                 <h3>Application Branding</h3>
@@ -3357,29 +3422,43 @@ export default function App() {
                     placeholder="Enter your Spotify app Client ID"
                   />
                 </label>
-                <div className="form-inline">
-                  <span
-                    className={
-                      spotify.connected ? "connected-dot" : "disconnected-dot"
-                    }
-                  ></span>
-                  <span>
-                    {spotify.connected
-                      ? `Connected as ${spotify.name}`
-                      : spotify.message}
-                  </span>
-                  <button className="primary" disabled={busy} onClick={connect}>
-                    {busy
-                      ? "Waiting for authorization..."
-                      : spotify.connected
-                        ? "Reconnect Spotify"
-                        : "Connect Spotify"}
-                  </button>
-                  {spotify.connected && (
-                    <button className="subtle" onClick={disconnect}>
-                      Disconnect Spotify
+                <small>
+                  <strong>Spotify Redirect URI</strong>
+                  <br />
+                  <code>http://127.0.0.1:8888/callback</code>
+                  <br />
+                  When creating a Spotify app in the Spotify Developer Dashboard,
+                  this Redirect URI is automatically added by default. Make sure
+                  it is listed under Redirect URIs. If missing, add it manually.
+                  Do not modify the URL.
+                </small>
+                <div className="spotify-connection-layout">
+                  <div className="spotify-connection-status">
+                    <span
+                      className={
+                        spotify.connected ? "connected-dot" : "disconnected-dot"
+                      }
+                    ></span>
+                    <span>
+                      {spotify.connected
+                        ? `Connected as ${spotify.name}`
+                        : spotify.message}
+                    </span>
+                  </div>
+                  <div className="spotify-connection-actions">
+                    <button className="primary" disabled={busy} onClick={connect}>
+                      {busy
+                        ? "Waiting for authorization..."
+                        : spotify.connected
+                          ? "Reconnect Spotify"
+                          : "Connect Spotify"}
                     </button>
-                  )}
+                    {spotify.connected && (
+                      <button className="subtle" onClick={disconnect}>
+                        Disconnect Spotify
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <small>
                   Create a Spotify app and allow the local callback URL shown
@@ -3421,19 +3500,22 @@ export default function App() {
                       placeholder="Enter your Google OAuth client ID"
                     />
                   </label>
-                  <div className="google-action-row">
-                    <span
-                      className={
-                        googleConnected ? "connected-dot" : "disconnected-dot"
-                      }
-                    ></span>
-                    <span className="google-status">
-                      {googleDemo
-                        ? "Demo mode  |  mock data"
-                        : googleConnected
-                          ? "Google account connected"
-                          : "Google account not connected"}
-                    </span>
+                  <div className="google-connection-layout">
+                    <div className="google-connection-status">
+                      <span
+                        className={
+                          googleConnected ? "connected-dot" : "disconnected-dot"
+                        }
+                      ></span>
+                      <span className="google-status">
+                        {googleDemo
+                          ? "Demo mode  |  mock data"
+                          : googleConnected
+                            ? "Google account connected"
+                            : "Google account not connected"}
+                      </span>
+                    </div>
+                    <div className="google-connection-actions">
                     <button
                       className="primary"
                       disabled={googleBusy}
@@ -3464,106 +3546,8 @@ export default function App() {
                     >
                       Load demo/test data
                     </button>
+                    </div>
                   </div>
-                  <section className="csv-import-help">
-                    <div>
-                      <h4>Import business hours from CSV</h4>
-                      <p>
-                        Choose the matching CSV type. Review the parsed hours
-                        and grouped schedules before applying changes.
-                      </p>
-                      <div className="csv-template-actions">
-                        <button
-                          className="subtle"
-                          onClick={() =>
-                            downloadBusinessHoursCsvTemplate("weekly")
-                          }
-                        >
-                          Download Weekly Hours Template (.csv)
-                        </button>
-                        <button
-                          className="subtle"
-                          onClick={() =>
-                            downloadBusinessHoursCsvTemplate("holidays")
-                          }
-                        >
-                          Download Holiday Exceptions Template (.csv)
-                        </button>
-                      </div>
-                      <div className="csv-format-grid">
-                        <div>
-                          <b>Weekly hours columns</b>
-                          <code>day, open_time, close_time, status</code>
-                          <small>Example: Monday, 08:00, 18:00, open</small>
-                        </div>
-                        <div>
-                          <b>Holiday exception columns</b>
-                          <code>date, name, open_time, close_time, status</code>
-                          <small>
-                            Example: 2026-12-25, Christmas Day, (empty),
-                            (empty), closed
-                          </small>
-                        </div>
-                      </div>
-                      <ul>
-                        <li>
-                          Weekly hours use full weekday names; holiday
-                          exceptions use YYYY-MM-DD dates.
-                        </li>
-                        <li>
-                          Times use 24-hour HH:mm format. Status must be open or
-                          closed.
-                        </li>
-                        <li>
-                          Closed rows can have empty opening and closing times.
-                        </li>
-                        <li>
-                          Matching weekly time ranges are grouped into one
-                          schedule with multiple selected days.
-                        </li>
-                        <li>
-                          Holiday exceptions override regular hours only on
-                          their specified dates.
-                        </li>
-                      </ul>
-                    </div>
-                    <div className="csv-upload-actions">
-                      <input
-                        ref={weeklyCsvInput}
-                        type="file"
-                        accept=".csv,text/csv"
-                        hidden
-                        onChange={(event) =>
-                          void importBusinessHoursCsv(event, "weekly")
-                        }
-                      />
-                      <button
-                        className="primary"
-                        disabled={googleBusy || googleImporting}
-                        onClick={() => weeklyCsvInput.current?.click()}
-                      >
-                        <FileUp size={16} />
-                        Upload Weekly Hours CSV
-                      </button>
-                      <input
-                        ref={holidayCsvInput}
-                        type="file"
-                        accept=".csv,text/csv"
-                        hidden
-                        onChange={(event) =>
-                          void importBusinessHoursCsv(event, "holidays")
-                        }
-                      />
-                      <button
-                        className="primary"
-                        disabled={googleBusy || googleImporting}
-                        onClick={() => holidayCsvInput.current?.click()}
-                      >
-                        <FileUp size={16} />
-                        Upload Holiday Exceptions CSV
-                      </button>
-                    </div>
-                  </section>
                   <small>
                     Google documents the Desktop token exchange secret as
                     optional. If Google reports that a client secret is missing,
@@ -3878,6 +3862,95 @@ export default function App() {
                   </div>
                 )}
               </div>
+              <section className="panel form-panel google-csv-panel csv-import-help">
+                  <div>
+                    <h4>Import business hours from CSV</h4>
+                    <p>
+                      Choose the matching CSV type. Review the parsed hours
+                      and grouped schedules before applying changes.
+                    </p>
+                    <div className="csv-template-actions">
+                      <button
+                        className="subtle"
+                        onClick={() => downloadBusinessHoursCsvTemplate("weekly")}
+                      >
+                        Download Weekly Hours Template (.csv)
+                      </button>
+                      <button
+                        className="subtle"
+                        onClick={() => downloadBusinessHoursCsvTemplate("holidays")}
+                      >
+                        Download Holiday Exceptions Template (.csv)
+                      </button>
+                    </div>
+                    <div className="csv-format-grid">
+                      <div>
+                        <b>Weekly hours columns</b>
+                        <code>day, open_time, close_time, status</code>
+                        <small>Example: Monday, 08:00, 18:00, open</small>
+                      </div>
+                      <div>
+                        <b>Holiday exception columns</b>
+                        <code>date, name, open_time, close_time, status</code>
+                        <small>
+                          Example: 2026-12-25, Christmas Day, (empty),
+                          (empty), closed
+                        </small>
+                      </div>
+                    </div>
+                    <ul>
+                      <li>
+                        Weekly hours use full weekday names; holiday exceptions
+                        use YYYY-MM-DD dates.
+                      </li>
+                      <li>
+                        Times use 24-hour HH:mm format. Status must be open or
+                        closed.
+                      </li>
+                      <li>Closed rows can have empty opening and closing times.</li>
+                      <li>
+                        Matching weekly time ranges are grouped into one schedule
+                        with multiple selected days.
+                      </li>
+                      <li>
+                        Holiday exceptions override regular hours only on their
+                        specified dates.
+                      </li>
+                    </ul>
+                  </div>
+                  <div className="csv-upload-actions">
+                    <input
+                      ref={weeklyCsvInput}
+                      type="file"
+                      accept=".csv,text/csv"
+                      hidden
+                      onChange={(event) => void importBusinessHoursCsv(event, "weekly")}
+                    />
+                    <button
+                      className="primary"
+                      disabled={googleBusy || googleImporting}
+                      onClick={() => weeklyCsvInput.current?.click()}
+                    >
+                      <FileUp size={16} />
+                      Upload Weekly Hours CSV
+                    </button>
+                    <input
+                      ref={holidayCsvInput}
+                      type="file"
+                      accept=".csv,text/csv"
+                      hidden
+                      onChange={(event) => void importBusinessHoursCsv(event, "holidays")}
+                    />
+                    <button
+                      className="primary"
+                      disabled={googleBusy || googleImporting}
+                      onClick={() => holidayCsvInput.current?.click()}
+                    >
+                      <FileUp size={16} />
+                      Upload Holiday Exceptions CSV
+                    </button>
+                  </div>
+              </section>
                 </div>
               )}
               {settingsTab === "scheduler" && (
@@ -4013,9 +4086,10 @@ export default function App() {
                   hours.
                 </p>
                 <div className="about-note">
-                  Schedules run while the application is open. Missed music
-                  starts are skipped after shutdown or sleep; active quiet
-                  periods are re-applied on startup or wake.
+                  Schedules use this computer’s local time. Missed music starts
+                  follow the recovery policy in Settings; expired announcements
+                  are skipped, and active Quiet Hours are re-applied on startup
+                  or wake.
                 </div>
                 <a
                   href="https://developer.spotify.com/documentation/web-api"

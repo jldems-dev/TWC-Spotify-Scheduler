@@ -23,6 +23,8 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { activeQuietSchedules, ScheduleCoordinator } from "./scheduler";
+import { AnnouncementService, type AnnouncementOccurrence, type AnnouncementServiceStatus } from "./announcement-service";
+import { BackupService, type BackupStatus } from "./backup-service";
 import { normalizeAdvertisementSchedule } from "./advertisement-schedule";
 import { captureQuietPlayback, quietRestorePlan } from "./quiet-state";
 import {
@@ -33,6 +35,8 @@ import {
   shouldLaunchSpotifyDesktop,
 } from "./spotify-playback";
 import { parseSecureToken } from "./spotify-token";
+import { classifySpotifyHealth, shouldRecoverUnexpectedStop, type SpotifyMonitorSnapshot } from "./spotify-monitor";
+import { isApprovedExternalUrl, isTrustedIpcRequest, redactSecrets } from "./security-utils";
 import { googleApiError } from "./google-api-utils";
 import { createGoogleCodeChallenge, exchangeGoogleAuthorizationCode, validateGoogleOAuthCallback } from "./google-oauth";
 import { missingPlaybackScopes, sanitizeSpotifyDevices, startScheduledPlayback, startSpotifyPlayback } from "./scheduled-playback";
@@ -75,6 +79,7 @@ const empty: Store = {
     schedulerEnabled: true,
     startWithWindows: false,
     startMinimizedToTray: false,
+    missedSchedulePolicy: "skip",
     pharmacyName: "TWC Stafford",
     pharmacyLogo: "",
     pharmacyIcon: "",
@@ -90,6 +95,8 @@ const empty: Store = {
 };
 const dataFile = () =>
   path.join(app.getPath("userData"), "scheduler-data.json");
+const backupDirectory = () => path.join(app.getPath("userData"), "backups");
+const backupSettingsFile = () => path.join(app.getPath("userData"), "backup-settings.json");
 const brandingDir = () => path.join(app.getPath("userData"), "branding");
 const brandingDefaults = { pharmacyName: "TWC Stafford", pharmacyLogo: "", pharmacyIcon: "" };
 const brandingFile = (name: string) => {
@@ -183,14 +190,6 @@ async function openSpotifyDesktop(): Promise<{ alreadyOpen: boolean }> {
     );
   }
 }
-function redactSecrets(value: unknown): string {
-  return String(value)
-    .replace(/\bBearer\s+[^\s"'<>]+/gi, "Bearer [REDACTED]")
-    .replace(
-      /(["']?(?:access_token|refresh_token|client_secret|code_verifier)["']?\s*[:=]\s*["']?)[^"',\s}]+/gi,
-      "$1[REDACTED]",
-    );
-}
 function startupLog(message: string) {
   message = redactSecrets(message);
   console.error(message);
@@ -260,6 +259,7 @@ async function readStore(): Promise<Store> {
     (sourceSettings.schedulerEnabled === undefined || typeof sourceSettings.schedulerEnabled === "boolean") &&
     (sourceSettings.startWithWindows === undefined || typeof sourceSettings.startWithWindows === "boolean") &&
     (sourceSettings.startMinimizedToTray === undefined || typeof sourceSettings.startMinimizedToTray === "boolean") &&
+    (sourceSettings.missedSchedulePolicy === undefined || ["skip", "latest-within-5-minutes"].includes(sourceSettings.missedSchedulePolicy)) &&
     (sourceSettings.spotifyClientId === undefined || (typeof sourceSettings.spotifyClientId === "string" && sourceSettings.spotifyClientId.length <= 200)) &&
     (sourceSettings.googleClientId === undefined || (typeof sourceSettings.googleClientId === "string" && sourceSettings.googleClientId.length <= 300)) &&
     (sourceSettings.defaultPlaylist === undefined || (typeof sourceSettings.defaultPlaylist === "string" && sourceSettings.defaultPlaylist.length <= 256)) &&
@@ -299,6 +299,7 @@ async function readStore(): Promise<Store> {
       schedulerEnabled: sourceSettings.schedulerEnabled ?? empty.settings.schedulerEnabled,
       startWithWindows: sourceSettings.startWithWindows ?? false,
       startMinimizedToTray: sourceSettings.startMinimizedToTray ?? false,
+      missedSchedulePolicy: sourceSettings.missedSchedulePolicy ?? "skip",
       spotifyClientId: sourceSettings.spotifyClientId ?? empty.settings.spotifyClientId,
       googleClientId: sourceSettings.googleClientId ?? "",
       ...(typeof sourceSettings.googleLocation === "string" ? { googleLocation: sourceSettings.googleLocation } : {}),
@@ -442,6 +443,8 @@ async function googleAccess(): Promise<string> {
   return updated.access_token;
 }
 async function validAccessToken(forceRefresh = false): Promise<string> {
+  if (spotifyRefreshInFlight) return spotifyRefreshInFlight;
+  const refresh = async (): Promise<string> => {
   const token = await readToken();
   if (!token?.access_token)
     throw new Error("Connect Spotify in Settings first.");
@@ -497,8 +500,17 @@ async function validAccessToken(forceRefresh = false): Promise<string> {
     expires_at: Date.now() + fresh.expires_in * 1000,
   };
   await writeToken(updated);
+  await addLog("info", "Spotify access token refreshed successfully.");
   return updated.access_token;
+  };
+  spotifyRefreshInFlight = refresh().catch(async error => {
+    const message = redactSecrets(error).replace(/^Error: /, "");
+    await addLog("warn", `Spotify token refresh failed: ${message}`);
+    throw error;
+  }).finally(() => { spotifyRefreshInFlight = null; });
+  return spotifyRefreshInFlight;
 }
+let spotifyRefreshInFlight: Promise<string> | null = null;
 async function spotifyStatus() {
   try {
     const access = await validAccessToken();
@@ -529,7 +541,17 @@ async function spotifyStatus() {
 let win: BrowserWindow;
 let tray: Tray | null = null;
 let scheduleCoordinator: ScheduleCoordinator | undefined;
+let announcementService: AnnouncementService | undefined;
+let spotifyMonitorTimer: NodeJS.Timeout | null = null;
+let spotifyHealth: SpotifyMonitorSnapshot = { state: "disconnected", message: "Connect Spotify in Settings.", connected: false };
+let spotifyHealthInFlight: Promise<void> | null = null;
+let spotifyCommandInFlight: Promise<unknown> | null = null;
+let monitorPreviouslyPlaying: boolean | null = null;
+let announcementAudioWindow: BrowserWindow | null = null;
+let backupService: BackupService | undefined;
 let shutdownLogging = false;
+let pendingRestore = false;
+let trayFallbackNoticeShown = false;
 type UpdateStatus = { status: "unsupported" | "idle" | "checking" | "current" | "available" | "downloading" | "downloaded" | "installing" | "error"; currentVersion: string; version?: string; percent?: number; message: string };
 let updaterStatus: UpdateStatus = { status: "idle", currentVersion: app.getVersion(), message: "Updates have not been checked yet." };
 let updaterCheckPromise: Promise<void> | null = null;
@@ -540,6 +562,61 @@ function publishUpdaterStatus(next: UpdateStatus, log?: { level: "info" | "warn"
     if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send("updater:status", updaterStatus);
   }
   if (log) void addLog(log.level, `[updater] ${log.message}`).catch((error) => startupLog(`[updater] Could not write updater log: ${String(error)}`));
+}
+function publishBackupStatus(status: BackupStatus) {
+  for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send("backup:status", status);
+}
+function validateBackupSnapshot(bytes: Buffer, includedPaths: string[]) {
+  let store: any; try { store = JSON.parse(bytes.toString("utf8")); } catch { throw new Error("Backup application settings are invalid."); }
+  if (!isRecord(store)) throw new Error("Backup application settings are invalid.");
+  const paths = new Set(includedPaths);
+  const announcements = Array.isArray(store.announcements) ? store.announcements : [];
+  const advertisements = Array.isArray(store.advertisements) ? store.advertisements : [];
+  for (const [category, items] of [["announcements", announcements], ["advertisements", advertisements]] as const) for (const item of items) {
+    if (!isRecord(item) || typeof item.id !== "string" || !/^[\w-]{36}$/.test(item.id) || typeof item.file !== "string" || !/^[\w-]{36}\.(mp3|wav)$/.test(item.file)) throw new Error(`Backup contains an invalid ${category} audio reference.`);
+    if (!paths.has(`${category}/${item.file}`)) throw new Error(`A referenced ${category} audio file is missing; backup was not marked complete.`);
+  }
+  const announcementById = new Set(announcements.map((item: any) => item.id));
+  for (const schedule of Array.isArray(store.announcementSchedules) ? store.announcementSchedules : []) {
+    const ids = schedule?.date ? [schedule.announcementId] : [schedule?.firstAnnouncementId, schedule?.secondAnnouncementId];
+    for (const id of ids) if (!announcementById.has(id)) throw new Error("An announcement schedule references audio that is missing from application data.");
+  }
+  const advertisementById = new Set(advertisements.map((item: any) => item.id));
+  for (const schedule of Array.isArray(store.advertisementSchedules) ? store.advertisementSchedules : []) for (const id of Array.isArray(schedule?.advertisementIds) ? schedule.advertisementIds : []) if (!advertisementById.has(id)) throw new Error("An advertisement schedule references audio that is missing from application data.");
+  for (const key of ["pharmacyLogo", "pharmacyIcon"]) {
+    const name = store.settings?.[key];
+    if (name && (!brandingFile(name) || !paths.has(`branding/${name}`))) throw new Error(`Configured ${key === "pharmacyLogo" ? "logo" : "icon"} file is missing from application data.`);
+  }
+}
+function createBackupService() {
+  return new BackupService({
+    userData: app.getPath("userData"), defaultDirectory: backupDirectory(), configFile: backupSettingsFile(), appVersion: app.getVersion(),
+    protectKey: key => { if (!secureStorageAvailable()) throw new Error("Windows secure storage is unavailable; encrypted backups cannot be created."); return safeStorage.encryptString(key.toString("base64")); },
+    unprotectKey: wrapped => { if (!secureStorageAvailable()) throw new Error("Windows secure storage is unavailable; this backup cannot be decrypted."); return Buffer.from(safeStorage.decryptString(wrapped), "base64"); },
+    getOverrides: async () => {
+      let source: any;
+      try {
+        const text = await fs.readFile(dataFile(), "utf8");
+        if (Buffer.byteLength(text, "utf8") > 10 * 1024 * 1024) throw new Error("Application settings exceed the supported backup size.");
+        source = JSON.parse(text);
+      } catch (error: any) {
+        if (error?.code === "ENOENT") source = structuredClone(empty);
+        else throw new Error(`Application settings could not be safely prepared for backup: ${String(error)}`);
+      }
+      if (!isRecord(source) || (source.settings !== undefined && !isRecord(source.settings)) ||
+        ["schedules", "exceptions", "playlists", "logs", "announcements", "announcementSchedules", "advertisements", "advertisementSchedules"].some(key => source[key] !== undefined && !Array.isArray(source[key]))) {
+        throw new Error("Application settings are invalid; backup stopped without substituting defaults.");
+      }
+      return { "scheduler-data.json": Buffer.from(JSON.stringify({ ...source, logs: [] }, null, 2), "utf8") };
+    },
+    validateStore: bytes => {
+      let value: any; try { value = JSON.parse(bytes.toString("utf8")); } catch { throw new Error("The backup settings file is not valid JSON."); }
+      if (!isRecord(value) || (value.settings !== undefined && !isRecord(value.settings)) || ["schedules", "exceptions", "playlists", "logs", "announcements", "announcementSchedules", "advertisements", "advertisementSchedules"].some(key => value[key] !== undefined && !Array.isArray(value[key]))) throw new Error("The backup settings file is incomplete or unsupported.");
+    },
+    validateSnapshot: validateBackupSnapshot,
+    log: addLog,
+    onStatus: publishBackupStatus,
+  });
 }
 function initializeUpdater() {
   if (!app.isPackaged) {
@@ -579,19 +656,15 @@ async function checkForUpdates() {
 const hasSingleInstance = app.requestSingleInstanceLock();
 if (!hasSingleInstance) app.quit();
 app.on("second-instance", () => {
-  if (win) {
-    if (win.isMinimized()) win.restore();
-    win.show();
-    win.focus();
-  }
+  if (typeof win === "undefined") pendingRestore = true;
+  else restoreMainWindow();
 });
 function assertTrustedSender(event: Electron.IpcMainInvokeEvent) {
-  if (!win || event.sender !== win.webContents)
-    throw new Error("Untrusted IPC sender.");
-  if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame)
-    throw new Error("IPC is only accepted from the application main frame.");
-  if (isTrustedAppUrl(event.senderFrame.url)) return;
-  throw new Error("IPC is only accepted from the application window.");
+  if (!isTrustedIpcRequest({
+    senderIsApplicationWindow: !!win && event.sender === win.webContents,
+    senderIsTopFrame: !!event.senderFrame && event.senderFrame === event.sender.mainFrame,
+    urlIsTrusted: !!event.senderFrame && isTrustedAppUrl(event.senderFrame.url),
+  })) throw new Error("Untrusted IPC sender or frame.");
 }
 function syncWindowsLoginItem(enabled: boolean) {
   if (process.platform !== "win32" || !app.isPackaged) return;
@@ -602,6 +675,9 @@ function isTrustedAppUrl(raw: string) {
     const url = new URL(raw);
     if (
       !app.isPackaged &&
+      url.pathname === "/" &&
+      !url.username &&
+      !url.password &&
       (url.origin === "http://localhost:5173" ||
         url.origin === "http://127.0.0.1:5173")
     )
@@ -616,31 +692,45 @@ function isTrustedAppUrl(raw: string) {
   }
 }
 function restoreMainWindow() {
-  if (!win || win.isDestroyed()) return;
+  if (!win || win.isDestroyed()) {
+    createWindow(true);
+    return;
+  }
   win.setSkipTaskbar(false);
   if (win.isMinimized()) win.restore();
   win.show();
   win.focus();
 }
 function createTray() {
-  if (tray) return;
+  if (tray && !tray.isDestroyed()) return true;
+  tray = null;
   const iconPath = app.isPackaged
     ? path.join(process.resourcesPath, "app-icon.ico")
     : path.join(app.getAppPath(), "assets/icons/app-icon.ico");
   const icon = nativeImage.createFromPath(iconPath);
   if (icon.isEmpty()) {
     startupLog("Could not create startup tray icon because the application icon is unavailable.");
-    return;
+    return false;
   }
-  tray = new Tray(icon);
-  tray.setToolTip("TWC Stafford Music Scheduler");
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: "Open TWC Spotify Scheduler", click: restoreMainWindow },
-    { type: "separator" },
-    { label: "Quit", click: () => app.quit() },
-  ]));
-  tray.on("click", restoreMainWindow);
-  tray.on("double-click", restoreMainWindow);
+  let createdTray: Tray | null = null;
+  try {
+    createdTray = new Tray(icon);
+    tray = createdTray;
+    createdTray.setToolTip("TWC Stafford Music Scheduler");
+    createdTray.setContextMenu(Menu.buildFromTemplate([
+      { label: "Open TWC Scheduler", click: restoreMainWindow },
+      { type: "separator" },
+      { label: "Quit TWC Scheduler", click: () => app.quit() },
+    ]));
+    createdTray.on("click", restoreMainWindow);
+    createdTray.on("double-click", restoreMainWindow);
+    return true;
+  } catch (error) {
+    createdTray?.destroy();
+    tray = null;
+    startupLog(`Could not create the system tray icon: ${String(error)}`);
+    return false;
+  }
 }
 function createWindow(showWindow = true) {
   const iconPath = app.isPackaged
@@ -664,32 +754,43 @@ function createWindow(showWindow = true) {
     contextIsolation: true,
     nodeIntegration: false,
     sandbox: true,
-    // The renderer owns announcement scheduling; keep its clock active while minimized.
+    webSecurity: true,
+    allowRunningInsecureContent: false,
+    spellcheck: true,
+    // Keep UI clock and status updates responsive while the app is minimized.
     backgroundThrottling: false,
   },
 });
   win.once("ready-to-show", () => {
     if (showWindow) win.show();
   });
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    try {
-      const parsed = new URL(url);
-      const allowedHosts = new Set([
-        "developer.spotify.com",
-        "support.spotify.com",
-      ]);
-      if (
-        parsed.protocol === "https:" &&
-        !parsed.username &&
-        !parsed.password &&
-        allowedHosts.has(parsed.hostname)
-      )
-        void shell.openExternal(parsed.toString()).catch(() =>
-          startupLog("[external] Could not open the approved Spotify help page."),
-        );
-    } catch {
-      /* Reject malformed URLs. */
+  win.on("close", (event) => {
+    if (shutdownLogging) return;
+    if (createTray()) {
+      event.preventDefault();
+      win.hide();
+      win.setSkipTaskbar(true);
+      return;
     }
+    // Keep the app and its scheduler alive, but leave the window reachable from
+    // the taskbar if Windows cannot provide a tray icon.
+    event.preventDefault();
+    win.setSkipTaskbar(false);
+    win.minimize();
+    if (!trayFallbackNoticeShown) {
+      trayFallbackNoticeShown = true;
+      void dialog.showMessageBox(win, {
+        type: "warning",
+        title: "System tray unavailable",
+        message: "The scheduler could not be minimized to the system tray.",
+        detail: "The app has been minimized to the taskbar so it remains accessible.",
+      });
+    }
+  });
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isApprovedExternalUrl(url)) void shell.openExternal(url).catch(() =>
+      startupLog("[external] Could not open the approved Spotify help page."),
+    );
     return { action: "deny" };
   });
   win.webContents.on("context-menu", (event, params) => {
@@ -757,9 +858,18 @@ app
       session.defaultSession.setSpellCheckerEnabled(true);
       startupLog("Native spell-check enabled with en-AU.");
     } else {
-      session.defaultSession.setSpellCheckerEnabled(false);
-      startupLog(`Native spell-check disabled because en-AU is unavailable (available: ${spellLanguages.join(", ")}).`);
+      session.defaultSession.setSpellCheckerEnabled(true);
+      startupLog(`Australian English spell-check is unavailable in this Electron build (available: ${spellLanguages.join(", ")}).`);
     }
+    session.defaultSession.on("spellcheck-dictionary-download-begin", (_event, languageCode) => {
+      if (languageCode === "en-AU") startupLog("Downloading the en-AU spell-check dictionary.");
+    });
+    session.defaultSession.on("spellcheck-dictionary-initialized", (_event, languageCode) => {
+      if (languageCode === "en-AU") startupLog("The en-AU spell-check dictionary is ready.");
+    });
+    session.defaultSession.on("spellcheck-dictionary-download-failure", (_event, languageCode) => {
+      if (languageCode === "en-AU") startupLog("The en-AU spell-check dictionary download failed.");
+    });
     session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
       if (details.resourceType !== "mainFrame") {
         callback({});
@@ -774,15 +884,21 @@ app
     startupLog(
       `Electron ready; packaged=${app.isPackaged}; appPath=${app.getAppPath()}; localTimeZone=${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
     );
+    try { backupService = createBackupService(); await backupService.initialize(); }
+    catch (error) { startupLog(`Automatic backup service could not start: ${String(error)}`); backupService = undefined; }
     const storeAtStartup = await readStore();
     // Windows does not expose wasOpenedAtLogin through Electron; this marker is
     // supplied only by the login item configured below.
     const openedAtLogin = process.platform === "win32" && app.isPackaged && process.argv.includes("--startup-tray");
     try { syncWindowsLoginItem(storeAtStartup.settings.startWithWindows === true); }
     catch (error) { startupLog(`Could not synchronize Windows startup registration: ${String(error)}`); }
-    const startMinimized = !!openedAtLogin && storeAtStartup.settings.startMinimizedToTray === true;
-    if (startMinimized) createTray();
+    const trayAvailable = createTray();
+    const startMinimized = !!openedAtLogin && storeAtStartup.settings.startMinimizedToTray === true && trayAvailable;
     createWindow(!startMinimized);
+    if (pendingRestore) {
+      pendingRestore = false;
+      restoreMainWindow();
+    }
     initializeUpdater();
     void updateWindowTitle().catch(() => undefined);
     app.on("activate", () => {
@@ -800,9 +916,10 @@ app
       },
       execute: executeScheduleBoundary,
       recoverQuiet: async () => {
+        if (!await readQuietSnapshot()) await saveQuietSnapshot(await currentPlayback());
         await pauseIfPlaying();
       },
-      enforceQuiet: pauseIfPlaying,
+      enforceQuiet: async () => pauseIfPlaying(),
       log: addLog,
     });
     const quietAtStartup = await readStore();
@@ -811,6 +928,20 @@ app
     }
     scheduleCoordinator.start();
     powerMonitor.on("resume", () => void scheduleCoordinator?.tick("wake"));
+    announcementService = new AnnouncementService({
+      stateFile: path.join(app.getPath("userData"), "announcement-runs.json"),
+      getStore: async () => { const data = await readStore(); return { schedules: data.announcementSchedules, announcements: data.announcements }; },
+      playback: currentPlayback,
+      pause: async () => pauseIfPlaying(),
+      resume: resumeSpotifyForAnnouncement,
+      execute: playScheduledAnnouncement,
+      log: addLog,
+      onStatus: publishAnnouncementStatus,
+    });
+    announcementService.start();
+    void spotifyMonitorTick();
+    spotifyMonitorTimer = setInterval(() => { void spotifyMonitorTick(); }, 30_000);
+    powerMonitor.on("resume", () => void announcementService?.tick("resume"));
     void addLog(
       "info",
       `Application started; local time zone ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`,
@@ -822,9 +953,9 @@ app.on("before-quit", (event) => {
   if (shutdownLogging) return;
   event.preventDefault();
   shutdownLogging = true;
-  scheduleCoordinator?.stop();
   startupLog("Application shutting down; scheduler stopped.");
-  void addLog("info", "Application stopped; scheduler stopped.")
+  void Promise.all([scheduleCoordinator?.stop(), announcementService?.stop(), backupService?.stop()])
+    .then(() => addLog("info", "Application stopped; scheduler stopped."))
     .catch((error) =>
       startupLog(`Could not save shutdown log: ${String(error)}`),
     )
@@ -841,9 +972,11 @@ process.on("unhandledRejection", (reason) => {
   void addLog("error", `Unhandled main-process rejection: ${String(reason)}`);
 });
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
+  // The app remains active in the tray; quitting is available from its menu.
 });
 app.on("will-quit", () => {
+  if (spotifyMonitorTimer) clearInterval(spotifyMonitorTimer);
+  spotifyMonitorTimer = null;
   tray?.destroy();
   tray = null;
 });
@@ -916,6 +1049,43 @@ ipcMain.handle("updater:status", (event) => {
   assertTrustedSender(event);
   return { ...updaterStatus, currentVersion: app.getVersion() };
 });
+ipcMain.handle("backup:status", (event) => { assertTrustedSender(event); return backupService?.status() || null; });
+ipcMain.handle("backup:update-settings", async (event, patch) => {
+  assertTrustedSender(event);
+  if (!isRecord(patch) || Object.keys(patch).some(key => !["enabled", "frequency", "retention"].includes(key))) throw new Error("Invalid backup settings.");
+  if (!backupService) throw new Error("Backup service is unavailable.");
+  return backupService.updateSettings(patch);
+});
+ipcMain.handle("backup:choose-destination", async (event) => {
+  assertTrustedSender(event);
+  if (!backupService) throw new Error("Backup service is unavailable.");
+  const result = await dialog.showOpenDialog(win, { title: "Choose Backup Folder", properties: ["openDirectory", "createDirectory"] });
+  if (result.canceled || !result.filePaths[0]) return null;
+  return backupService.setDestination(result.filePaths[0]);
+});
+ipcMain.handle("backup:create", async (event) => {
+  assertTrustedSender(event);
+  if (!backupService) throw new Error("Backup service is unavailable.");
+  return backupService.createBackup("manual", { force: true });
+});
+ipcMain.handle("backup:select-restore", async (event) => {
+  assertTrustedSender(event);
+  if (!backupService) throw new Error("Backup service is unavailable.");
+  return backupService.selectRestoreFile(async () => {
+    const result = await dialog.showOpenDialog(win, { title: "Select a TWC Scheduler Backup", properties: ["openFile"], filters: [{ name: "TWC Encrypted Backup", extensions: ["twcbak"] }] });
+    return result.canceled ? null : result.filePaths[0] || null;
+  });
+});
+ipcMain.handle("backup:restore", async (event, token: string) => {
+  assertTrustedSender(event);
+  if (!backupService) throw new Error("Backup service is unavailable.");
+  await Promise.all([scheduleCoordinator?.stop(), announcementService?.stop()]);
+  let result: any;
+  try { result = await backupService.restore(token); }
+  catch (error) { scheduleCoordinator?.start(); announcementService?.start(); throw error; }
+  setTimeout(() => { app.relaunch(); app.quit(); }, 1200);
+  return result;
+});
 ipcMain.handle("updater:check", async (event) => {
   assertTrustedSender(event);
   return checkForUpdates();
@@ -924,6 +1094,11 @@ ipcMain.handle("updater:install", async (event) => {
   assertTrustedSender(event);
   if (!app.isPackaged || updaterStatus.status !== "downloaded" || updaterInstallRequested) return false;
   updaterInstallRequested = true;
+  try { await backupService?.createBackup("pre-update", { force: true }); }
+  catch (primaryError) {
+    try { await backupService?.createBackup("pre-update", { force: true, destination: backupDirectory() }); }
+    catch (fallbackError) { await addLog("warn", `Pre-update backup could not be created; continuing the user-approved update. ${String(fallbackError || primaryError)}`).catch(() => undefined); }
+  }
   void addLog("info", `[updater] User confirmed restart and installation of version ${updaterStatus.version || "new"}.`).catch(() => undefined);
   publishUpdaterStatus({ status: "installing", currentVersion: app.getVersion(), version: updaterStatus.version, percent: 100, message: `Closing the application to silently install version ${updaterStatus.version || "new"}…` });
   // The user approved by clicking the renderer's install button. Keep NSIS
@@ -931,7 +1106,7 @@ ipcMain.handle("updater:install", async (event) => {
   autoUpdater.quitAndInstall(true, true);
   return true;
 });
-ipcMain.handle("data:save", async (_e, input) => {
+ipcMain.handle("data:save", async (_e, input, validateOnly = false) => {
   assertTrustedSender(_e);
   const validDays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   let serializedSize: number;
@@ -1072,12 +1247,13 @@ ipcMain.handle("data:save", async (_e, input) => {
       !validImage
     ) throw new Error("Invalid Spotify playlist data.");
   }
-  const settingKeys = new Set(["schedulerEnabled", "startWithWindows", "startMinimizedToTray", "spotifyClientId", "googleClientId", "googleLocation", "googleLocationTitle", "googleLastSync", "googleSyncMinutes", "defaultPlaylist", "timezone", "pharmacyName", "pharmacyLogo", "pharmacyIcon"]);
+  const settingKeys = new Set(["schedulerEnabled", "startWithWindows", "startMinimizedToTray", "missedSchedulePolicy", "spotifyClientId", "googleClientId", "googleLocation", "googleLocationTitle", "googleLastSync", "googleSyncMinutes", "defaultPlaylist", "timezone", "pharmacyName", "pharmacyLogo", "pharmacyIcon"]);
   if (
     Object.keys(input.settings).some((key) => !settingKeys.has(key)) ||
     typeof input.settings.schedulerEnabled !== "boolean" ||
     (input.settings.startWithWindows !== undefined && typeof input.settings.startWithWindows !== "boolean") ||
     (input.settings.startMinimizedToTray !== undefined && typeof input.settings.startMinimizedToTray !== "boolean") ||
+    (input.settings.missedSchedulePolicy !== undefined && !["skip", "latest-within-5-minutes"].includes(input.settings.missedSchedulePolicy)) ||
     typeof input.settings.spotifyClientId !== "string" ||
     input.settings.spotifyClientId.length > 200 ||
     (input.settings.googleClientId !== undefined && (typeof input.settings.googleClientId !== "string" || input.settings.googleClientId.length > 300)) ||
@@ -1087,6 +1263,7 @@ ipcMain.handle("data:save", async (_e, input) => {
       (typeof input.settings.timezone !== "string" || input.settings.timezone.length > 128))
   )
     throw new Error("Invalid settings data.");
+  if (validateOnly === true) return true;
   await withStoreMutation(async () => {
     const current = await readStore();
     await writeStore({
@@ -1094,6 +1271,7 @@ ipcMain.handle("data:save", async (_e, input) => {
         schedulerEnabled: input.settings.schedulerEnabled,
         startWithWindows: input.settings.startWithWindows === true,
         startMinimizedToTray: input.settings.startMinimizedToTray === true,
+        missedSchedulePolicy: input.settings.missedSchedulePolicy === "latest-within-5-minutes" ? "latest-within-5-minutes" : "skip",
         spotifyClientId: input.settings.spotifyClientId,
         googleClientId: input.settings.googleClientId || "",
         ...(typeof input.settings.googleLocation === "string" ? { googleLocation: input.settings.googleLocation } : {}),
@@ -1166,6 +1344,31 @@ async function readAudioFile(kind: "announcements" | "advertisements", id: strin
     throw error;
   }
 }
+function publishAnnouncementStatus(status: AnnouncementServiceStatus) {
+  if (win && !win.isDestroyed()) win.webContents.send("announcements:status", status);
+}
+async function playScheduledAnnouncement(event: AnnouncementOccurrence, audio: any, options: { resumeAfter: boolean }) {
+  const spotifyConnected = (await spotifyStatus()).connected;
+  const customWasPlaying = event.custom && options.resumeAfter && spotifyConnected ? !!(await currentPlayback())?.is_playing : false;
+  if (spotifyConnected) await pauseIfPlaying();
+  let player: BrowserWindow | null = null;
+  announcementAudioWindow = player;
+  try {
+    const source = await readAudioFile("announcements", audio.id);
+    player = new BrowserWindow({ show: false, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false, autoplayPolicy: "no-user-gesture-required" } });
+    announcementAudioWindow = player;
+    await player.loadURL("about:blank");
+    const volume = Math.max(0, Math.min(100, Number(audio.volume ?? 100))) / 100;
+    // The only source is a validated app-owned audio file. The isolated window
+    // receives no preload and has no Node or application IPC capabilities.
+    await player.webContents.executeJavaScript(`(() => { const audio = new Audio(${JSON.stringify(source)}); audio.volume = ${volume}; window.__twcAnnouncementAudio = audio; return new Promise((resolve, reject) => { audio.onended = () => resolve(true); audio.onerror = () => reject(new Error("Announcement audio could not be decoded or played.")); audio.play().catch(reject); }); })()`);
+    await addLog("info", `Announcement audio completed: ${audio.name || audio.id} (${event.key}).`);
+  } finally {
+    if (player && !player.isDestroyed()) player.destroy();
+    if (announcementAudioWindow === player) announcementAudioWindow = null;
+    if (event.custom && options.resumeAfter && customWasPlaying) await resumeSpotifyForAnnouncement();
+  }
+}
 async function deleteAudioFile(kind: "announcements" | "advertisements", id: string) {
   if (typeof id !== "string" || !/^[\w-]{36}$/.test(id)) throw new Error("Invalid announcement.");
   const store = await readStore(); const item = store[kind].find((a: any) => a.id === id);
@@ -1173,6 +1376,7 @@ async function deleteAudioFile(kind: "announcements" | "advertisements", id: str
   return true;
 }
 ipcMain.handle("announcements:import", async (event) => { assertTrustedSender(event); return importAudioFiles("announcements"); });
+ipcMain.handle("announcements:status", (event) => { assertTrustedSender(event); return announcementService?.status() || { running: false, busy: false, active: null, last: null, error: null }; });
 ipcMain.handle("announcements:audio", async (event, id: string) => { assertTrustedSender(event); return readAudioFile("announcements", id); });
 ipcMain.handle("announcements:delete-file", async (event, id: string) => { assertTrustedSender(event); return deleteAudioFile("announcements", id); });
 ipcMain.handle("advertisements:import", async (event) => { assertTrustedSender(event); return importAudioFiles("advertisements"); });
@@ -1234,11 +1438,12 @@ ipcMain.handle("window:action", (event, action) => {
 });
 ipcMain.handle("spotify:status", (event) => {
   assertTrustedSender(event);
-  return spotifyStatus();
+  return spotifyStatus().then(status => ({ ...status, state: spotifyHealth.state, recoveryMessage: spotifyHealth.message }));
 });
 ipcMain.handle("spotify:disconnect", async (event) => {
   assertTrustedSender(event);
   await deleteToken();
+  publishSpotifyHealth(classifySpotifyHealth({ authenticated: false }));
   await addLog("info", "Spotify disconnected.");
   return { connected: false, message: "Spotify disconnected." };
 });
@@ -1513,6 +1718,7 @@ async function spotifyRequest(
       getAccessToken: () => validAccessToken(),
       refreshAccessToken: () => validAccessToken(true),
       onUnauthorized: deleteToken,
+      onRetry: (attempt, status, retryAfter) => addLog("warn", `Spotify request retry ${attempt}/2${status ? ` after HTTP ${status}` : " after a temporary network failure"}${retryAfter ? `; Retry-After ${retryAfter}s` : ""}.`),
     });
   } catch (error) {
     throw new Error(redactSecrets(error));
@@ -1534,6 +1740,10 @@ ipcMain.handle(
   "spotify:control",
   async (event, action: string, value?: number) => {
     assertTrustedSender(event);
+    const announcementState = announcementService?.status();
+    if (announcementState?.busy || announcementState?.active || announcementState?.windowActive) throw new Error("Spotify controls are paused while a scheduled announcement is active.");
+    if (spotifyCommandInFlight) throw new Error("A Spotify playback command is already running. Wait for it to finish before sending another command.");
+    spotifyCommandInFlight = Promise.resolve();
     try {
     if (
       !["play", "pause", "previous", "next", "volume"].includes(action)
@@ -1555,7 +1765,10 @@ ipcMain.handle(
           onStage: stage => event.sender.send("spotify:playback-stage", { stage }),
         });
         await addLog("info", `Manual playback start accepted on an active Spotify device (device ID present: yes; transferred: ${started.transferred}).`);
-        return await currentPlayback();
+        const confirmed = await currentPlayback();
+        await addLog("info", `Spotify playback verification result: play ${confirmed?.is_playing ? "confirmed" : "not confirmed"}.`);
+        if (!confirmed?.is_playing) throw new Error("Spotify accepted Play, but playback could not be confirmed.");
+        return confirmed;
       }
       const playback = await currentPlayback();
       const deviceId =
@@ -1593,7 +1806,10 @@ ipcMain.handle(
         "info",
         `Spotify playback command completed: ${action}${action === "volume" ? ` ${value}%` : ""}.`,
       );
-      return await currentPlayback();
+      const confirmed = await currentPlayback();
+      if (action === "pause" && confirmed?.is_playing) throw new Error("Spotify accepted Pause, but playback is still active.");
+      await addLog("info", `Spotify playback verification result: ${action} ${action === "pause" ? (!confirmed?.is_playing ? "confirmed" : "not confirmed") : "state refreshed"}.`);
+      return confirmed;
     } catch (e) {
       if (action === "play") event.sender.send("spotify:playback-stage", { stage: "playback-failed" });
       await addLog(
@@ -1601,6 +1817,8 @@ ipcMain.handle(
         `Spotify playback command failed (${action}): ${String(e)}`,
       );
       throw new Error(redactSecrets(e));
+    } finally {
+      spotifyCommandInFlight = null;
     }
   },
 );
@@ -1638,17 +1856,89 @@ async function currentPlayback() {
   if (!sameActiveDevice) return { ...state, device };
   return { ...state, device, actions: state.actions };
 }
+function publishSpotifyHealth(next: SpotifyMonitorSnapshot) {
+  const changed = next.state !== spotifyHealth.state || next.deviceKey !== spotifyHealth.deviceKey;
+  const previous = spotifyHealth;
+  spotifyHealth = next;
+  if (!changed) return;
+  const { deviceKey: _previousDevice, ...safePrevious } = previous;
+  const { deviceKey: _nextDevice, ...safeNext } = next;
+  void addLog("info", `Spotify connection state changed: ${safePrevious.state} -> ${safeNext.state}${next.deviceName ? `; device ${next.deviceName}` : ""}.`);
+  for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send("spotify:health", safeNext);
+}
+async function spotifyMonitorTick() {
+  if (spotifyHealthInFlight) return spotifyHealthInFlight;
+  spotifyHealthInFlight = (async () => {
+    const token = await readToken();
+    if (!token?.access_token) { publishSpotifyHealth(classifySpotifyHealth({ authenticated: false })); return; }
+    try {
+      await validAccessToken();
+      const response = await spotifyRequest("GET", "/me/player/devices");
+      const devices = Array.isArray(response?.devices) ? response.devices : [];
+      const playback = await spotifyRequest("GET", "/me/player");
+      const next = classifySpotifyHealth({ authenticated: true, devices });
+      publishSpotifyHealth(next);
+      if (next.state === "no-playback-device") await addLog("warn", "Spotify has no available controllable playback device.");
+      if (monitorPreviouslyPlaying === true && playback?.is_playing !== true) await recoverUnexpectedPlaybackStop();
+      monitorPreviouslyPlaying = playback?.is_playing === true;
+    } catch (error) {
+      const next = classifySpotifyHealth({ authenticated: true, error });
+      publishSpotifyHealth(next);
+      if (next.state === "authentication-required") await addLog("error", "Spotify authentication is required; reconnect the account in Settings.");
+    }
+  })().finally(() => { spotifyHealthInFlight = null; });
+  return spotifyHealthInFlight;
+}
+async function recoverUnexpectedPlaybackStop() {
+  const now = new Date(), day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][now.getDay()];
+  const store = await readStore();
+  const announcement = announcementService?.status();
+  const minute = now.getHours() * 60 + now.getMinutes();
+  const schedule = (store.schedules as any[]).find(item => !item.quiet && item.enabled !== false && item.days?.includes(day) && /^\d{2}:\d{2}$/.test(item.start) && /^\d{2}:\d{2}$/.test(item.end) && minute >= Number(item.start.slice(0, 2)) * 60 + Number(item.start.slice(3)) && minute < Number(item.end.slice(0, 2)) * 60 + Number(item.end.slice(3)) && typeof item.playlistId === "string");
+  if (!shouldRecoverUnexpectedStop({ previouslyPlaying: monitorPreviouslyPlaying === true, currentlyPlaying: false, schedulerEnabled: store.settings.schedulerEnabled === true, quiet: activeQuietSchedules(store.schedules as any, now).length > 0, announcementBusy: !!(announcement?.busy || announcement?.active), announcementWindowActive: !!announcement?.windowActive, activeMusicSchedule: !!schedule })) return;
+  try {
+    await verifyScheduledPlaybackScopes();
+    await startScheduledPlayback({ playlistId: schedule.playlistId, getPlayback: async () => await spotifyRequest("GET", "/me/player"), getDevices: freshSpotifyDevices, transfer: async deviceId => { const command = transferPlaybackCommand(deviceId); await spotifyRequest(command.method, command.endpoint, command.body); }, play: async (deviceId, playlistUri) => { const command = playlistPlaybackCommand(playlistUri!, deviceId); await spotifyRequest(command.method, command.endpoint, command.body); }, onDevices: (devices, stage) => logSpotifyDeviceSnapshot(devices, stage, "monitor recovery"), onStage: () => undefined });
+    await addLog("info", `Spotify playback recovered for the active scheduled playlist "${String(schedule.name || "Music schedule").slice(0, 100)}" after an unexpected stop.`);
+  } catch (error) { await addLog("error", `Spotify playback recovery failed: ${redactSecrets(error)}`); }
+}
 async function verifyScheduledPlaybackScopes() {
   const token = await readToken();
   const missing = missingPlaybackScopes(token?.scope);
   if (missing.length)
     throw new Error(`Spotify authorization is missing or does not report required permission(s): ${missing.join(", ")}. Reconnect Spotify and approve playback state and control access.`);
 }
-async function pauseIfPlaying() {
+async function pauseIfPlaying(maxAttempts = 3) {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const state = await currentPlayback();
+      if (!state?.is_playing) return false;
+      await spotifyRequest("PUT", "/me/player/pause");
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const confirmed = await currentPlayback();
+      if (!confirmed?.is_playing) return true;
+      lastError = new Error("Spotify pause command did not confirm; playback was still active.");
+    } catch (error) {
+      lastError = error;
+      if (!/network request failed|request timed out|\(429\)|\(5\d\d\)/i.test(String(error))) throw error;
+    }
+    if (attempt < maxAttempts) await new Promise(resolve => setTimeout(resolve, attempt * 750));
+  }
+  throw lastError instanceof Error ? lastError : new Error(`Spotify pause command failed after ${maxAttempts} verification attempt${maxAttempts === 1 ? "" : "s"}.`);
+}
+async function resumeSpotifyForAnnouncement() {
   const state = await currentPlayback();
-  if (!state?.is_playing) return false;
-  await spotifyRequest("PUT", "/me/player/pause");
-  return true;
+  if (state?.is_playing) return;
+  await verifyScheduledPlaybackScopes();
+  await startSpotifyPlayback({
+    getPlayback: async () => await spotifyRequest("GET", "/me/player"),
+    getDevices: freshSpotifyDevices,
+    transfer: async deviceId => { const command = transferPlaybackCommand(deviceId); await spotifyRequest(command.method, command.endpoint, command.body); },
+    play: async deviceId => { const command = playbackCommand("play", deviceId); await spotifyRequest(command.method, command.endpoint); },
+    onDevices: (devices, stage) => logSpotifyDeviceSnapshot(devices, stage, "announcement recovery"),
+    onStage: () => undefined,
+  });
 }
 const quietSnapshotFile = () =>
   path.join(app.getPath("userData"), "quiet-playback-state.json");
@@ -1679,6 +1969,7 @@ async function restoreQuietSnapshot() {
     );
     return;
   }
+  let restored = false;
   try {
     const plan = quietRestorePlan(snapshot);
     if (!plan) {
@@ -1693,10 +1984,19 @@ async function restoreQuietSnapshot() {
       }
       return;
     }
+    const current = await currentPlayback();
+    if (current?.is_playing && current.context?.uri === plan.context_uri) {
+      restored = true;
+      return;
+    }
     const { positionMs, ...body } = plan;
     await spotifyRequest("PUT", "/me/player/play", body);
     if (positionMs > 0)
       await spotifyRequest("PUT", `/me/player/seek?position_ms=${positionMs}`);
+    const confirmed = await currentPlayback();
+    if (!confirmed?.is_playing || confirmed.context?.uri !== plan.context_uri)
+      throw new Error("Spotify did not confirm restored playback after Quiet Hours.");
+    restored = true;
     await addLog(
       "info",
       "Restored the pre-quiet-hours Spotify context and playback state.",
@@ -1708,35 +2008,43 @@ async function restoreQuietSnapshot() {
     );
     throw error;
   } finally {
-    try {
-      await fs.unlink(quietSnapshotFile());
-    } catch {
-      /* Snapshot cleanup is best effort. */
+    if (restored) {
+      try {
+        await fs.unlink(quietSnapshotFile());
+      } catch {
+        /* Snapshot cleanup is best effort. */
+      }
     }
   }
 }
 async function executeScheduleBoundary(event: {
   schedule: any;
   boundary: "start" | "end";
-}) {
+}): Promise<void | { skipped: string }> {
   const { schedule, boundary } = event;
   if (schedule.quiet) {
     if (boundary === "start") {
-      if (await readQuietSnapshot()) return;
+      if (await readQuietSnapshot()) { await pauseIfPlaying(1); return; }
       const state = await currentPlayback();
       await saveQuietSnapshot(state);
-      if (state?.is_playing) await spotifyRequest("PUT", "/me/player/pause");
+      if (state?.is_playing) await pauseIfPlaying(1);
       return;
     }
     const current = await readStore();
-    if (activeQuietSchedules(current.schedules as any, new Date()).length) return;
+    if (activeQuietSchedules(current.schedules as any, new Date()).length)
+      return { skipped: "Another Quiet Hours schedule remains active." };
     await restoreQuietSnapshot();
     return;
+  }
+  const announcementState = announcementService?.status();
+  if (boundary === "start" && (announcementState?.busy || announcementState?.active || announcementState?.windowActive)) {
+    await addLog("info", `Skipped scheduled playback for ${schedule.name} because an announcement is active.`);
+    return { skipped: "An announcement is active." };
   }
   if (boundary === "start") {
     if (activeQuietSchedules((await readStore()).schedules as any, new Date()).length) {
       await addLog("info", `Skipped scheduled playback for ${schedule.name} because a No Playback schedule is active.`);
-      return;
+      return { skipped: "An active Quiet Hours schedule blocked playback." };
     }
     if (!schedule.playlistId)
       throw new Error("This schedule has no Spotify playlist assigned.");
@@ -1761,5 +2069,5 @@ async function executeScheduleBoundary(event: {
   const state = await currentPlayback();
   const expected = `spotify:playlist:${schedule.playlistId}`;
   if (state?.is_playing && state.context?.uri === expected)
-    await spotifyRequest("PUT", "/me/player/pause");
+    await pauseIfPlaying(1);
 }

@@ -56,13 +56,17 @@ type SpotifyRequestOptions = {
   onUnauthorized?: () => Promise<void>;
   fetcher?: typeof fetch;
   timeoutMs?: number;
+  onRetry?: (attempt: number, status?: number, retryAfter?: string | null) => void | Promise<void>;
+  wait?: (milliseconds: number) => Promise<void>;
 };
 
 /** Spotify Web API request with one forced-refresh retry for 401 responses only. */
 export async function requestSpotifyApi(options: SpotifyRequestOptions): Promise<any | null> {
   const fetcher = options.fetcher || fetch;
   let accessToken = await options.getAccessToken();
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const retryable = options.method === 'GET' || options.method === 'PUT';
+  let transientAttempt = 0;
+  for (let authAttempt = 0; authAttempt < 2;) {
     let response: Response;
     try {
       response = await fetcher(`https://api.spotify.com/v1${options.endpoint}`, {
@@ -73,11 +77,28 @@ export async function requestSpotifyApi(options: SpotifyRequestOptions): Promise
       });
     } catch (error: any) {
       const timeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+      if (retryable && transientAttempt < 2) {
+        transientAttempt++;
+        await options.onRetry?.(transientAttempt);
+        await (options.wait || (ms => new Promise(resolve => setTimeout(resolve, ms))))(Math.min(8000, 500 * 2 ** (transientAttempt - 1)));
+        continue;
+      }
       throw new Error(timeout ? `Spotify request timed out (${options.method} ${options.endpoint}).` : `Spotify network request failed (${options.method} ${options.endpoint}): ${String(error?.message || error)}`);
     }
-    if (response.status === 401 && attempt === 0) {
+    if (response.status === 401 && authAttempt === 0) {
       try { await response.body?.cancel(); } catch { /* Best effort before the one allowed auth retry. */ }
+      authAttempt++;
       accessToken = await options.refreshAccessToken();
+      continue;
+    }
+    if ((response.status === 429 || response.status >= 500) && retryable && transientAttempt < 2) {
+      const retryAfter = response.headers.get('Retry-After');
+      try { await response.body?.cancel(); } catch { /* Best effort before retry. */ }
+      transientAttempt++;
+      await options.onRetry?.(transientAttempt, response.status, retryAfter);
+      const seconds = Number(retryAfter);
+      const delay = response.status === 429 && Number.isFinite(seconds) && seconds >= 0 ? Math.min(60_000, seconds * 1000) : Math.min(8000, 500 * 2 ** (transientAttempt - 1));
+      await (options.wait || (ms => new Promise(resolve => setTimeout(resolve, ms))))(delay);
       continue;
     }
     if (response.status === 401) await options.onUnauthorized?.();

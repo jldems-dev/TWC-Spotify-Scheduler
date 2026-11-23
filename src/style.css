@@ -1020,6 +1020,9 @@ svg {
 .branding-panel > small { display: block; margin: 12px 0; color: #7485a2; line-height: 1.5; }
 .branding-panel .form-inline { margin-top: 16px; }
 .branding-panel .form-inline button { margin-left: 0; }
+.general-settings-panel button { min-height: 42px; min-width: 150px; }
+.general-settings-panel .form-inline { gap: 10px; }
+.general-settings-panel .form-inline button { margin-left: 0; }
 .updater-message { margin: 8px 0 14px !important; color: #596b84 !important; }
 .updater-downloaded { color: #157347 !important; }
 .updater-error { color: #b42318 !important; }
@@ -1803,3 +1806,98 @@ svg {
 }
 .settings-tab-panel { min-width: 0; }
 .settings-tab-panel > .form-panel { margin-top: 0; }
+.settings-tab-panel select {
+  width: 100%;
+  max-width: 590px;
+  min-width: 0;
+  height: 42px;
+  padding: 0 12px;
+  color: #1d2b44;
+  background: #fff;
+  border: 1px solid #dce3ed;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: inherit;
+  outline: none;
+}
+.settings-tab-panel select:focus,
+.settings-tab-panel .google-panel select:focus-visible {
+  border-color: #438bfa;
+  box-shadow: 0 0 0 3px #438bfa20;
+  outline: none;
+}
+.settings-tab-panel button.primary,
+.settings-tab-panel button.subtle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-width: 150px;
+  min-height: 42px;
+  padding: 8px 16px;
+  border: 1px solid;
+  border-radius: 9px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  text-align: center;
+  transition: color 120ms ease, background 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+.settings-tab-panel button.primary {
+  color: #fff;
+  background: #287eff;
+  border-color: #287eff;
+}
+.settings-tab-panel button.primary:hover:not(:disabled) {
+  color: #fff;
+  background: #126ce9;
+  border-color: #126ce9;
+}
+.settings-tab-panel button.subtle {
+  color: #40516d;
+  background: #fff;
+  border-color: #dbe3ef;
+}
+.settings-tab-panel button.subtle:hover:not(:disabled) {
+  color: #1d2b44;
+  background: #f6f8fc;
+  border-color: #c8d4e4;
+}
+.settings-tab-panel button.primary:focus-visible,
+.settings-tab-panel button.subtle:focus-visible {
+  outline: 2px solid #438bfa;
+  outline-offset: 2px;
+}
+.settings-tab-panel button.primary:disabled,
+.settings-tab-panel button.subtle:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+.settings-tab-panel button.primary:disabled {
+  color: #fff;
+  background: #287eff;
+  border-color: #287eff;
+}
+.settings-tab-panel button.subtle:disabled {
+  color: #40516d;
+  background: #fff;
+  border-color: #dbe3ef;
+}
+.settings-tab-panel .form-inline button { margin-left: 0; }
+.settings-tab-panel .google-import-row { justify-content: flex-start; }
+#settings-panel-spotify .form-inline > span:nth-child(2) { flex: 0 1 auto; }
+.settings-tab-panel .google-action-row .google-status { flex: 0 1 auto; }
+.settings-tab-panel .google-import-row small { flex: 0 1 220px; }
+.settings-tab-panel .google-review-actions { justify-content: flex-start; }
+.settings-tab-panel .spotify-connection-layout { display: grid; gap: 12px; }
+.settings-tab-panel .spotify-connection-status { display: flex; align-items: center; gap: 10px; min-width: 0; color: #5c6f8a; font-size: 13px; }
+.settings-tab-panel .spotify-connection-status > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.settings-tab-panel .spotify-connection-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.settings-tab-panel .spotify-connection-actions button { margin: 0; }
+.settings-tab-panel .google-connection-layout { display: grid; gap: 12px; margin-top: 12px; }
+.settings-tab-panel .google-connection-status { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.settings-tab-panel .google-connection-status .google-status { flex: 0 1 auto; }
+.settings-tab-panel .google-connection-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.settings-tab-panel .google-connection-actions button { margin: 0; }
+.settings-tab-panel .google-csv-panel { margin-top: 0; }

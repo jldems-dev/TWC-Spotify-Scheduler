@@ -1,4 +1,5 @@
 export function announcementEventsAt(schedules: any[], now: Date): Array<{ schedule: any; boundary: "start" | "end"; key: string }>;
+export function unexpiredAnnouncementEvents(schedules: any[], now: Date): Array<{ schedule: any; boundary: "start" | "end"; key: string }>;
 export function announcementWindowActive(schedules: any[], now: Date): boolean;
 export function validateAnnouncementSchedule(schedule: any): string | null;
 export function saveAnnouncementSchedule(schedules: any[], schedule: any): any[];

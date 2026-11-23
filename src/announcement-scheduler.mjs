@@ -24,6 +24,10 @@ export function announcementEventsAt(schedules, now) {
     ];
   });
 }
+/** Announcements are minute-boundary actions and expire as soon as that minute passes. */
+export function unexpiredAnnouncementEvents(schedules, now) {
+  return announcementEventsAt(schedules, now);
+}
 export function announcementWindowActive(schedules, now) {
   const mins = now.getHours()*60+now.getMinutes();
   return (schedules || []).some(s => !s.date && s.enabled && s.days?.includes(weekdays[now.getDay()]) && mins >= Number(s.start?.slice(0,2))*60+Number(s.start?.slice(3)) && mins < Number(s.end?.slice(0,2))*60+Number(s.end?.slice(3)) && s.end > s.start);
