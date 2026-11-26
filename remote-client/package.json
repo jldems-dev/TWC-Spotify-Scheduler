@@ -1,7 +1,7 @@
 {
   "name": "twc-spotify-remote",
   "productName": "TWC Spotify Client",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "LAN remote control for TWC Spotify Scheduler",
   "main": "main.cjs",
   "author": "TWC Stafford",
