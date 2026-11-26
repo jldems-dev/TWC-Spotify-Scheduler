@@ -1,0 +1,86 @@
+name: Publish TWC Spotify Client Windows release
+
+on:
+  push:
+    tags:
+      - 'client-v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: client-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  client-release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Validate Client tag
+        run: |
+          $version = node -p "require('./remote-client/package.json').version"
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' -or $env:GITHUB_REF_NAME -cne "client-v$version") {
+            throw 'The Client tag must match the stable version in remote-client/package.json.'
+          }
+
+      - run: npm ci
+
+      - name: Build independent Client installer and metadata
+        run: npm run package:remote:win
+
+      - name: Stage Client release assets
+        run: |
+          $localName = 'TWC Spotify Client Setup.exe'
+          $assetName = 'TWC-Spotify-Client-Setup.exe'
+          Copy-Item -LiteralPath "release-remote/$localName" -Destination "release-remote/$assetName"
+          $channelFile = 'release-remote/client.yml'
+          $manifest = Get-Content -LiteralPath $channelFile -Raw
+          $encodedName = [uri]::EscapeDataString($localName)
+          $manifest = $manifest.Replace($localName, $assetName).Replace($encodedName, $assetName)
+          $version = $env:GITHUB_REF_NAME.Substring('client-v'.Length)
+          $hash = [Convert]::ToBase64String([Convert]::FromHexString((Get-FileHash -LiteralPath "release-remote/$assetName" -Algorithm SHA512).Hash))
+          $size = (Get-Item -LiteralPath "release-remote/$assetName").Length
+          if ($manifest -notmatch '(?m)^    size: ') {
+            $manifest = $manifest -replace '(?m)^  - url: TWC-Spotify-Client-Setup[.]exe\r?$', ("  - url: $assetName" + [Environment]::NewLine + "    size: $size")
+          }
+          foreach ($entry in @("version: $version", "url: $assetName", "sha512: $hash", "size: $size")) {
+            if (-not $manifest.Contains($entry)) { throw "Client metadata is missing the expected $entry." }
+          }
+          Set-Content -LiteralPath $channelFile -Value $manifest -Encoding utf8NoBOM
+
+      - name: Publish and verify Client-only release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $assets = @('release-remote/TWC-Spotify-Client-Setup.exe', 'release-remote/client.yml')
+          gh release view $tag --repo $env:GITHUB_REPOSITORY --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit $tag --repo $env:GITHUB_REPOSITORY --latest=false
+            if ($LASTEXITCODE -ne 0) { throw 'Could not keep the Client release separate from the Scheduler latest release.' }
+            gh release upload $tag @assets --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            gh release create $tag @assets --repo $env:GITHUB_REPOSITORY --verify-tag --latest=false --title "TWC Spotify Client $($tag.Substring(8))" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Client release upload failed.' }
+          $dir = Join-Path $env:RUNNER_TEMP "client-assets-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          gh release download $tag --repo $env:GITHUB_REPOSITORY --dir $dir --pattern 'client.yml' --pattern 'TWC-Spotify-Client-Setup.exe'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the Client release assets.' }
+          foreach ($asset in $assets) {
+            $name = Split-Path -Leaf $asset
+            $original = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash
+            $download = (Get-FileHash -LiteralPath (Join-Path $dir $name) -Algorithm SHA256).Hash
+            if ($original -cne $download) { throw "SHA-256 mismatch for $name." }
+          }
