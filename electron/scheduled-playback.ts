@@ -15,6 +15,26 @@ export type SpotifyDevice = {
 export type SpotifyDeviceStage = 'initial' | 'after-transfer';
 export type SpotifyPlaybackStage = 'transfer-requested' | 'device-switching' | 'playback-starting' | 'playing' | 'paused' | 'playback-failed';
 
+export function defaultPlaylistSettings(playlistId: string, uri?: string) {
+  const canonicalUri = /^spotify:playlist:[A-Za-z0-9]{22}$/.test(playlistId) ? playlistId
+    : /^[A-Za-z0-9]{22}$/.test(playlistId) ? `spotify:playlist:${playlistId}` : '';
+  return {
+    defaultPlaylist: canonicalUri ? canonicalUri.slice('spotify:playlist:'.length) : playlistId,
+    defaultPlaylistUri: uri === canonicalUri ? uri : canonicalUri,
+  };
+}
+
+export function scheduledPlaylistUri(
+  settings: { defaultPlaylist?: string; defaultPlaylistUri?: string },
+  schedulePlaylistId?: string,
+  overridePlaylistId?: string,
+): string {
+  const saved = defaultPlaylistSettings(settings.defaultPlaylist || '', settings.defaultPlaylistUri);
+  const playlist = saved.defaultPlaylistUri || saved.defaultPlaylist || overridePlaylistId || schedulePlaylistId;
+  if (!playlist) throw new Error('Select a default Spotify playlist or assign a playlist to this schedule.');
+  return spotifyPlaylistUri(playlist);
+}
+
 export function spotifyPlaylistUri(playlistId: string): string {
   const uri = playlistId.startsWith('spotify:playlist:') ? playlistId : `spotify:playlist:${playlistId}`;
   if (!/^spotify:playlist:[A-Za-z0-9]{22}$/.test(uri)) throw new Error('This schedule has an invalid Spotify playlist ID. Refresh playlists and select a valid playlist.');

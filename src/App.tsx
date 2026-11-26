@@ -101,6 +101,7 @@ const seed = {
   settings: {
     spotifyClientId: "",
     defaultPlaylist: "",
+    defaultPlaylistUri: "",
     schedulerEnabled: true,
     startWithWindows: false,
     startMinimizedToTray: false,
@@ -124,6 +125,114 @@ const nav: { name: Page; icon: any }[] = [
   { name: "Logs", icon: ScrollText },
   { name: "About", icon: Info },
 ];
+function LanRemoteSettings() {
+  const [status, setStatus] = useState<Awaited<ReturnType<typeof window.twc.lanRemoteStatus>> | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  useEffect(() => {
+    if (busy) return;
+    let active = true;
+    const refresh = () => {
+      void window.twc.lanRemoteStatus().then(value => {
+        if (active) setStatus(value);
+      }).catch(() => {
+        if (active) setError("Could not check LAN remote access.");
+      });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 3000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [busy]);
+
+  async function configure(enabled: boolean) {
+    setBusy(true);
+    setError("");
+    try {
+      setStatus(await window.twc.configureLanRemote(enabled));
+    } catch {
+      setError("Could not save the LAN remote access preference.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revokePairings() {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await window.twc.revokeLanPairings();
+      setNotice("Controller pairings revoked.");
+    } catch {
+      setError("Could not revoke controller pairings.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="panel form-panel">
+      <h3>LAN Remote</h3>
+      <p>Open the remote address in a browser on the same local network and enter the access code.</p>
+      <div className="setting-readonly">
+        <strong role="status">{status ? (status.online ? "Online" : status.enabled ? "Offline" : "Disabled") : "Checking connection"}</strong>
+        <span>LAN IP {status?.address || "unavailable"}</span>
+        {status?.url && <code>{status.url}</code>}
+      </div>
+      {status?.accessCode && (
+        <label>Access code<input readOnly value={status.accessCode} onFocus={event => event.currentTarget.select()} /></label>
+      )}
+      {notice && <p role="status">{notice}</p>}
+      {(error || status?.error) && <p role="alert">{error || status?.error}</p>}
+      <small>HTTP is unencrypted. Use a trusted private network and keep the access code private. The code changes when the remote service restarts.</small>
+      <div className="lan-remote-actions">
+        <button className="primary" type="button" disabled={busy || !status} onClick={() => void configure(!status?.online)}>
+          {status?.online ? "Disable remote access" : status?.enabled ? "Retry remote access" : "Enable remote access"}
+        </button>
+        <button className="outline" type="button" disabled={busy} onClick={() => void revokePairings()}>Revoke all controller pairings</button>
+        {status?.enabled && !status.online && (
+          <button type="button" disabled={busy} onClick={() => void configure(false)}>Disable remote access</button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RemoteControllerDownload() {
+  const [installer, setInstaller] = useState<Awaited<ReturnType<typeof window.twc.remoteInstaller>>>();
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    let active = true;
+    void window.twc.remoteInstaller().then(value => {
+      if (active) setInstaller(value);
+    }).catch(() => {
+      if (active) setError(true);
+    });
+    return () => { active = false; };
+  }, []);
+
+  return (
+    <div className="panel form-panel">
+      <h3>TWC Spotify Client</h3>
+      {installer ? (
+        <>
+          <div className="setting-readonly"><strong>Latest version</strong><span>{installer.version}</span></div>
+          <p><a href={installer.url} target="_blank" rel="noreferrer">Download Windows installer</a></p>
+          <details><summary>Installer SHA-256</summary><code style={{ overflowWrap: "anywhere" }}>{installer.sha256}</code></details>
+        </>
+      ) : (
+        <p role="status">{error ? "Could not check GitHub for the installer. Reopen LAN Remote to retry." : installer === null ? "The Windows installer is not available in a published release yet." : "Checking GitHub for the latest version?"}</p>
+      )}
+      <ol>
+        <li>Enable LAN remote access above and keep the Scheduler running.</li>
+        <li>On the other Windows computer, run the installer and open TWC Spotify Client.</li>
+        <li>Enter the Scheduler Server Address shown above and pair using the access code. TWC Spotify Client saves the pairing securely and reconnects on subsequent launches.</li>
+      </ol>
+    </div>
+  );
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>("Home"),
     [settingsTab, setSettingsTab] = useState("general"),
@@ -210,6 +319,19 @@ export default function App() {
     observer.observe(document.body, { childList: true, subtree: true });
     return () => observer.disconnect();
   }, []);
+  const [audioActivity, setAudioActivity] = useState<Awaited<ReturnType<typeof window.twc.audioActivity>> | null>(null);
+  const spotifyControlsBlocked = !audioActivity || audioActivity.blocked;
+  useEffect(() => {
+    let initial = true;
+    const unsubscribe = window.twc.onAudioActivity((status) => {
+      initial = false;
+      setAudioActivity(status);
+    });
+    void window.twc.audioActivity().then((status) => {
+      if (initial) setAudioActivity(status);
+    }).catch(() => undefined);
+    return () => { initial = false; unsubscribe(); };
+  }, []);
   const [announcementServiceStatus, setAnnouncementServiceStatus] = useState<any>({ running: false, busy: false, active: null, last: null, error: null });
   useEffect(() => {
     let live = true;
@@ -273,10 +395,30 @@ export default function App() {
   const playbackActionLock = useRef(false);
   const weeklyCsvInput = useRef<HTMLInputElement>(null);
   const holidayCsvInput = useRef<HTMLInputElement>(null);
-  const persist = async (next: any) => {
-    setData(next);
+  const [pendingDefaultPlaylist, setPendingDefaultPlaylist] = useState<string | null>(null);
+  const currentDefaultPlaylist = pendingDefaultPlaylist ?? data.settings.defaultPlaylist;
+  async function setDefaultPlaylist(playlistId: string) {
+    setPendingDefaultPlaylist(playlistId);
     try {
-      await window.twc.save(next);
+      const selection = await window.twc.setDefaultPlaylist(playlistId);
+      setData((current: any) => ({ ...current, settings: { ...current.settings, ...selection } }));
+    } catch (error) {
+      notify(`Could not save the default playlist: ${String(error)}`);
+    } finally {
+      setPendingDefaultPlaylist(null);
+    }
+  }
+  const persist = async (next: any, replaceDefaultPlaylist = false) => {
+    setData((current: any) => replaceDefaultPlaylist ? next : {
+      ...next,
+      settings: {
+        ...next.settings,
+        defaultPlaylist: current.settings.defaultPlaylist,
+        defaultPlaylistUri: current.settings.defaultPlaylistUri,
+      },
+    });
+    try {
+      await window.twc.save(next, replaceDefaultPlaylist);
     } catch (e) {
       notify(String(e));
       void window.twc.log(
@@ -286,7 +428,7 @@ export default function App() {
     }
   };
   const stopTestAdvertisement = () => {
-    advertisementTestGeneration.current++;
+    const generation = advertisementTestGeneration.current++;
     advertisementTestBusy.current = false;
     const audio = advertisementAudioRef.current;
     if (audio) {
@@ -297,35 +439,43 @@ export default function App() {
     }
     advertisementAudioRef.current = null;
     setActiveTestAdvertisementId(null);
-    restoreSpotifyAfterAdvertisement();
+    restoreSpotifyAfterAdvertisement(finishRendererAudio("advertisement", generation));
   };
   const logAdvertisementTest = (level: string, message: string) => {
     void window.twc.log(level, `Advertisement: ${message}`).catch(() => undefined);
   };
-  async function confirmedSpotifyAction(action: "play" | "pause") {
+  async function pauseSpotifyForAudio() {
     let lastError: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         const before = await window.twc.spotifyPlayback();
-        if (action === "pause" ? !before?.is_playing : !!before?.is_playing) return;
-        await window.twc.spotifyControl(action);
+        if (!before?.is_playing) return;
+        await window.twc.spotifyControl("pause");
         await new Promise((resolve) => window.setTimeout(resolve, 500));
         const after = await window.twc.spotifyPlayback();
-        if (action === "pause" ? !after?.is_playing : !!after?.is_playing) return;
-        lastError = new Error(`Spotify did not confirm the ${action} command.`);
+        if (!after?.is_playing) return;
+        lastError = new Error(`Spotify did not confirm the pause command.`);
       } catch (error) {
         lastError = error;
         if (!/network request failed|request timed out|\(429\)|\(5\d\d\)|did not confirm/i.test(String(error))) throw error;
       }
       if (attempt < 3) await new Promise((resolve) => window.setTimeout(resolve, attempt * 750));
     }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError || `Spotify ${action} command failed.`));
+    throw lastError instanceof Error ? lastError : new Error(String(lastError || `Spotify pause command failed.`));
   }
-  function restoreSpotifyAfterAdvertisement() {
+  function finishRendererAudio(
+    kind: "announcement" | "advertisement",
+    generation: number,
+  ): Promise<void> {
+    if (generation < 1) return Promise.resolve();
+    return window.twc.setRendererAudioActivity(kind, generation, false)
+      .catch((error) => notify(String(error)));
+  }
+  function restoreSpotifyAfterAdvertisement(released = Promise.resolve()) {
     const shouldResume = advertisementPlaybackWasPlaying.current;
     advertisementPlaybackWasPlaying.current = false;
     if (!shouldResume) return;
-    void confirmedSpotifyAction("play").catch((error: any) => {
+    void released.then(() => window.twc.resumeSpotifyAfterAudio()).catch((error: any) => {
       notify(`Advertisement finished, but Spotify could not be resumed: ${String(error).replace(/^Error: /, "")}`);
     });
   }
@@ -363,7 +513,7 @@ export default function App() {
         const state = await window.twc.spotifyPlayback();
         if (!isCurrent()) return false;
         advertisementPlaybackWasPlaying.current = state?.is_playing === true;
-        if (state?.is_playing) await confirmedSpotifyAction("pause");
+        if (state?.is_playing) await pauseSpotifyForAudio();
       }
       if (!isCurrent()) {
         restoreSpotifyAfterAdvertisement();
@@ -379,11 +529,13 @@ export default function App() {
         setActiveTestAdvertisementId(null);
         advertisementTestBusy.current = false;
         logAdvertisementTest(success ? "info" : "error", `${source} playback ${success ? "completed" : "failed"}; advertisement ID ${id}`);
-        restoreSpotifyAfterAdvertisement();
+        restoreSpotifyAfterAdvertisement(finishRendererAudio("advertisement", generation));
         if (!success && source === "test") notify("The advertisement preview could not be played. Check that the audio file is valid.");
       };
       audio.onended = () => finish(true);
       audio.onerror = () => finish(false);
+      await window.twc.setRendererAudioActivity("advertisement", generation, true, advertisementPlaybackWasPlaying.current);
+      if (!isCurrent()) { finishRendererAudio("advertisement", generation); return false; }
       await audio.play();
       if (!isCurrent()) return false;
       if (audio.paused) throw new Error("The audio player did not enter the playing state.");
@@ -395,7 +547,7 @@ export default function App() {
       setActiveTestAdvertisementId(null);
       advertisementTestBusy.current = false;
       logAdvertisementTest("error", `${source} playback failed; ${String(error)}`);
-      restoreSpotifyAfterAdvertisement();
+      restoreSpotifyAfterAdvertisement(finishRendererAudio("advertisement", generation));
       if (source === "test") notify(`Advertisement preview failed: ${String(error).replace(/^Error: /, "")}`);
       return false;
     } finally {
@@ -485,7 +637,7 @@ export default function App() {
   useEffect(() => {
     if (announcementServiceStatus.error) notify(announcementServiceStatus.error);
   }, [announcementServiceStatus.error]);
-  function restoreSpotifyAfterAnnouncement() {
+  function restoreSpotifyAfterAnnouncement(released = Promise.resolve()) {
     const shouldResume = announcementPlayback.current.wasPlaying;
     canceledTestStartup.current = false;
     if (!shouldResume) {
@@ -495,7 +647,7 @@ export default function App() {
     }
     const generation = announcementGeneration.current;
     let pending: Promise<void>;
-    pending = confirmedSpotifyAction("play")
+    pending = released.then(() => window.twc.resumeSpotifyAfterAudio())
       .then(() => {
         if (announcementGeneration.current === generation) {
           announcementPlayback.current.wasPlaying = false;
@@ -514,7 +666,7 @@ export default function App() {
   }
   function stopTestAnnouncement() {
     if (activeAnnouncementModeRef.current !== "test") return;
-    announcementGeneration.current++;
+    const generation = announcementGeneration.current++;
     const audio = activeAnnouncementAudioRef.current;
     if (audio) {
       audio.onended = null;
@@ -529,7 +681,8 @@ export default function App() {
     setActiveTestAnnouncementId(null);
     announcementPlayback.current.active = false;
     canceledTestStartup.current = announcementActionLock.current;
-    if (!announcementActionLock.current) restoreSpotifyAfterAnnouncement();
+    const released = finishRendererAudio("announcement", generation);
+    if (!announcementActionLock.current) restoreSpotifyAfterAnnouncement(released);
   }
   async function playAnnouncement(
     id: string,
@@ -563,6 +716,7 @@ export default function App() {
       previousAudio.onerror = null;
       previousAudio.pause();
       previousAudio.currentTime = 0;
+      finishRendererAudio("announcement", announcementGeneration.current);
     }
     const generation = ++announcementGeneration.current;
     announcementActionLock.current = true;
@@ -604,7 +758,7 @@ export default function App() {
           if (announcementPlayback.current.wasPlaying)
             localStorage.setItem("twc-announcement-window-was-playing", "1");
         }
-        if (state?.is_playing) await confirmedSpotifyAction("pause");
+        if (state?.is_playing) await pauseSpotifyForAudio();
       }
       if (generation !== announcementGeneration.current) {
         restoreCanceledTest();
@@ -633,7 +787,8 @@ export default function App() {
         setActiveTestAnnouncementId(null);
         announcementPlayback.current.active = false;
         announcementActionLock.current = false;
-        if (resumeAfter) restoreSpotifyAfterAnnouncement();
+        const released = finishRendererAudio("announcement", generation);
+        if (resumeAfter) restoreSpotifyAfterAnnouncement(released);
         if (!success)
           void window.twc.log(
             "error",
@@ -647,6 +802,12 @@ export default function App() {
           "The announcement could not be played. Check that the audio file is valid.",
         );
       };
+      await window.twc.setRendererAudioActivity("announcement", generation, true, resumeAfter && announcementPlayback.current.wasPlaying);
+      if (generation !== announcementGeneration.current) {
+        finishRendererAudio("announcement", generation);
+        restoreCanceledTest();
+        return false;
+      }
       await audio.play();
       if (generation === announcementGeneration.current)
         announcementActionLock.current = false;
@@ -663,7 +824,8 @@ export default function App() {
       setActiveTestAnnouncementId(null);
       announcementPlayback.current.active = false;
       announcementActionLock.current = false;
-      if (resumeAfter) restoreSpotifyAfterAnnouncement();
+      const released = finishRendererAudio("announcement", generation);
+      if (resumeAfter) restoreSpotifyAfterAnnouncement(released);
       void window.twc.log(
         "error",
         `Announcement playback failed: ${String(error)}`,
@@ -753,6 +915,10 @@ export default function App() {
         }
         void playAdvertisement(id, "scheduled");
       }
+      const randomTimes: [string, number][] = (data.advertisementSchedules || [])
+        .filter((schedule: any) => schedule.enabled && schedule.type === "random")
+        .map((schedule: any) => [schedule.id, Number(localStorage.getItem(randomKey(schedule.id)) || 0)]);
+      void window.twc.reportRandomAdvertisementTimes(randomTimes).catch(() => undefined);
     };
     tick();
     const timer = window.setInterval(tick, 1000);
@@ -912,7 +1078,7 @@ export default function App() {
   }, [page]);
   const playlists = data.playlists || [];
   const defaultList = playlists.find(
-    (p: any) => p.id === data.settings.defaultPlaylist,
+    (p: any) => p.id === currentDefaultPlaylist,
   );
   useEffect(() => {
     const interval = Number(data.settings.googleSyncMinutes || 0);
@@ -1003,8 +1169,7 @@ export default function App() {
     };
   }, [spotify.connected, data.schedules, playbackPending, playbackStage]);
   async function playbackControl(action: string, value?: number) {
-    if (playbackActionLock.current) return;
-    if (advertisementAudioRef.current) stopTestAdvertisement();
+    if (playbackActionLock.current || spotifyControlsBlocked) return;
     playbackActionLock.current = true;
     const version = ++playbackSyncVersion.current;
     setPlaybackPending(true);
@@ -1046,7 +1211,7 @@ export default function App() {
       setSpotify(status);
       const ps = await window.twc.playlists();
       const next = { ...data, playlists: ps };
-      setData(next);
+      setData((current: any) => ({ ...current, playlists: ps }));
       await window.twc.save(next);
       notify("Spotify account verified and playlists loaded.");
     } catch (e) {
@@ -1335,7 +1500,7 @@ export default function App() {
         exceptions: resolved.exceptions,
       };
       await window.twc.save(next);
-      setData(next);
+      setData((current: any) => ({ ...current, schedules: next.schedules, exceptions: next.exceptions }));
       setGooglePreview(null);
       notify(
         `Applied ${resolved.acceptedCount} music periods and ${resolved.exceptionCount} holiday overrides. ${resolved.skippedCount} periods kept existing schedules.`,
@@ -1602,12 +1767,12 @@ export default function App() {
                     </span>
                     <div>
                       <b>
-                        {deviceInfo.computerName || "Computer name unavailable"}
+                        {playback?.activeDeviceName || "No active Spotify device"}
                       </b>
                       <div className="spotify-container">
                         <span className="spotify-process-status">
                           {deviceInfo.spotifyRunning === null ? (
-                            "Status unavailable."
+                            "Local Spotify status unavailable."
                           ) : (
                             <>
                               <i
@@ -1628,7 +1793,7 @@ export default function App() {
                             type="button"
                             className="spotify-open-button"
                             onClick={() => void openSpotifyDesktop()}
-                            disabled={openingSpotify}
+                            disabled={openingSpotify || spotifyControlsBlocked}
                           >
                             {openingSpotify ? "Opening..." : "Open Spotify"}
                           </button>
@@ -1658,7 +1823,7 @@ export default function App() {
                       </b>
                       <span>
                         {nextSchedule
-                          ? `${nextSchedule.schedule.name}  |  ${nextSchedule.boundary}${nextSchedule.exception?.type === "replace" ? "  |  date replacement" : ""}`
+                          ? `${nextSchedule.schedule.name}  |  ${nextSchedule.boundary}${!data.settings.defaultPlaylist && nextSchedule.exception?.type === "replace" ? "  |  date replacement" : ""}`
                           : data.settings.schedulerEnabled
                             ? "Configure a schedule to get started"
                             : "Enable the scheduler in Settings to run actions"}
@@ -1677,6 +1842,7 @@ export default function App() {
                     aria-label="Previous track"
                     title="Previous track"
                     disabled={
+                      spotifyControlsBlocked ||
                       !playback?.device?.is_usable ||
                       playback?.device?.is_restricted ||
                       !!playback?.actions?.disallows?.skipping_prev ||
@@ -1690,6 +1856,7 @@ export default function App() {
                     className="play-toggle"
                     aria-label={playback?.is_playing ? "Pause" : "Play"}
                     disabled={
+                      spotifyControlsBlocked ||
                       playbackPending ||
                       !playback?.device?.is_usable ||
                       playback?.device?.is_restricted ||
@@ -1717,6 +1884,7 @@ export default function App() {
                     aria-label="Next track"
                     title="Next track"
                     disabled={
+                      spotifyControlsBlocked ||
                       !playback?.device?.is_usable ||
                       playback?.device?.is_restricted ||
                       !!playback?.actions?.disallows?.skipping_next ||
@@ -1736,6 +1904,7 @@ export default function App() {
                     max="100"
                     value={volumeDraft ?? playback?.device?.volume_percent ?? 0}
                     disabled={
+                      spotifyControlsBlocked ||
                       !playback?.device?.is_usable ||
                       !playback?.device?.supports_volume
                     }
@@ -1745,6 +1914,13 @@ export default function App() {
                   />
                   <b>{playback?.device?.volume_percent ?? "-"}%</b>
                 </div>
+                {(audioActivity?.announcement || audioActivity?.advertisement) && (
+                  <span className="playback-note" role="status">
+                    {audioActivity.announcement && <><strong>Announcement Playing</strong><br /></>}
+                    {audioActivity.advertisement && <><strong>Advertisement Playing</strong><br /></>}
+                    Spotify controls are temporarily disabled while an announcement or advertisement is playing.
+                  </span>
+                )}
                 <span className="playback-note">
                   {playback?.device?.supports_volume === false
                     ? "Volume control unavailable on this device"
@@ -1866,7 +2042,9 @@ export default function App() {
                           <span>
                             {s.quiet
                               ? "Quiet hours"
-                              : s.playlistName || "No playlist assigned"}
+                              : data.settings.defaultPlaylist
+                                ? defaultList?.name || "Default playlist unavailable"
+                                : s.playlistName || "No playlist assigned"}
                             {s.enabled ? "" : "  |  Paused"}
                           </span>
                         </div>
@@ -2008,13 +2186,14 @@ export default function App() {
 
                       <button
                         className={
-                          data.settings.defaultPlaylist === p.id
+                          currentDefaultPlaylist === p.id
                             ? "selected-pill"
                             : "subtle"
                         }
-                        onClick={() => updateSetting("defaultPlaylist", p.id)}
+                        disabled={pendingDefaultPlaylist !== null || currentDefaultPlaylist === p.id}
+                        onClick={() => void setDefaultPlaylist(p.id)}
                       >
-                        {data.settings.defaultPlaylist === p.id
+                        {currentDefaultPlaylist === p.id
                           ? "Default"
                           : "Set default"}
                       </button>
@@ -3268,10 +3447,16 @@ export default function App() {
                 sub="Application preferences and connected services."
               />
               <div className="settings-tabs" role="tablist" aria-label="Settings sections">
-                {[["general", "General"], ["updates", "Updates"], ["spotify", "Spotify"], ["google", "Google Business"], ["scheduler", "Scheduler"], ["audio", "Audio"]].map(([id, label]) => (
+                {[["general", "General"], ["updates", "Updates"], ["spotify", "Spotify"], ["google", "Google Business"], ["scheduler", "Scheduler"], ["audio", "Audio"], ["remote", "LAN Remote"]].map(([id, label]) => (
                   <button key={id} id={`settings-tab-${id}`} type="button" role="tab" aria-selected={settingsTab === id} aria-controls={`settings-panel-${id}`} tabIndex={settingsTab === id ? 0 : -1} className={settingsTab === id ? "active" : ""} onClick={() => setSettingsTab(id)}>{label}</button>
                 ))}
               </div>
+              {settingsTab === "remote" && (
+                <div id="settings-panel-remote" role="tabpanel" aria-labelledby="settings-tab-remote" className="settings-tab-panel">
+                  <LanRemoteSettings />
+                  <RemoteControllerDownload />
+                </div>
+              )}
               {settingsTab === "updates" && (
                 <div id="settings-panel-updates" role="tabpanel" aria-labelledby="settings-tab-updates" className="settings-tab-panel">
               <div className="panel form-panel updater-panel">
@@ -3314,7 +3499,7 @@ export default function App() {
                             if (!payload || payload.format !== "twc-spotify-scheduler-settings" || payload.version !== 1 || !payload.data || typeof payload.data !== "object" || !payload.data.settings || !Array.isArray(payload.data.schedules) || !Array.isArray(payload.data.exceptions) || !Array.isArray(payload.data.playlists)) throw new Error("This is not a supported TWC Scheduler settings export.");
                             await window.twc.validateSettingsImport(payload.data);
                             if (!window.confirm("Import and apply these settings? Existing application settings, schedules and playlist configuration will be overwritten.")) return;
-                            await window.twc.save(payload.data);
+                            await window.twc.save(payload.data, true);
                             setData(await window.twc.load());
                             notify("Settings imported successfully.");
                           } catch (error) { notify(`Import failed: ${String(error).replace(/^Error: /, "")}`); }
@@ -3997,10 +4182,11 @@ export default function App() {
                         ...data.settings,
                         schedulerEnabled: true,
                         defaultPlaylist: "",
+                        defaultPlaylistUri: "",
                         spotifyClientId: "",
                       },
                     };
-                    void persist(next);
+                    void persist(next, true);
                   }}
                 >
                   Restore settings defaults
@@ -4134,6 +4320,7 @@ export default function App() {
       {modal !== false && (
         <ScheduleDialog
           initial={modal}
+          hasDefaultPlaylist={!!data.settings.defaultPlaylist}
           playlists={playlists}
           schedules={data.schedules}
           onCancel={() => setModal(false)}
@@ -4339,6 +4526,7 @@ function BrandAsset({ variant }: { variant: "logo" | "mark" }) {
 }
 function ScheduleDialog({
   initial,
+  hasDefaultPlaylist,
   playlists,
   schedules,
   onCancel,
@@ -4508,7 +4696,7 @@ function ScheduleDialog({
           </label>
         </div>
         <label>
-          Playlist
+          {hasDefaultPlaylist ? "Fallback playlist" : "Playlist"}
           <select
             value={form.playlistId}
             disabled={form.quiet}

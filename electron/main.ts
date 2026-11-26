@@ -22,24 +22,32 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { appendFileSync, existsSync, mkdirSync } from "node:fs";
-import { activeQuietSchedules, ScheduleCoordinator } from "./scheduler";
+import { activeQuietSchedules, boundariesAt, scheduleExceptionFor, ScheduleCoordinator, type Boundary } from "./scheduler";
 import { AnnouncementService, type AnnouncementOccurrence, type AnnouncementServiceStatus } from "./announcement-service";
 import { BackupService, type BackupStatus } from "./backup-service";
 import { normalizeAdvertisementSchedule } from "./advertisement-schedule";
+import { RendererAudioActivity } from "./active-audio";
+import { LanRemote } from "./lan-remote";
+import { LanPairings } from "./lan-pairing";
+import { remotePlaybackBlock, remoteScheduleSummary } from "./lan-remote-dashboard";
 import { captureQuietPlayback, quietRestorePlan } from "./quiet-state";
 import {
   playbackCommand,
+  pauseSpotifyPlayback,
+  isSpotifyConnectionError,
   playlistPlaybackCommand,
   transferPlaybackCommand,
   usableDevice,
+  activePlaybackDeviceName,
   shouldLaunchSpotifyDesktop,
 } from "./spotify-playback";
 import { parseSecureToken } from "./spotify-token";
 import { classifySpotifyHealth, shouldRecoverUnexpectedStop, type SpotifyMonitorSnapshot } from "./spotify-monitor";
+import { findRemoteInstaller, type RemoteInstaller } from "./remote-release";
 import { isApprovedExternalUrl, isTrustedIpcRequest, redactSecrets } from "./security-utils";
 import { googleApiError } from "./google-api-utils";
 import { createGoogleCodeChallenge, exchangeGoogleAuthorizationCode, validateGoogleOAuthCallback } from "./google-oauth";
-import { missingPlaybackScopes, sanitizeSpotifyDevices, startScheduledPlayback, startSpotifyPlayback } from "./scheduled-playback";
+import { defaultPlaylistSettings, missingPlaybackScopes, sanitizeSpotifyDevices, scheduledPlaylistUri, spotifyPlaylistUri, startScheduledPlayback, startSpotifyPlayback } from "./scheduled-playback";
 import {
   readSpotifyResponse,
   requestSpotifyApi,
@@ -76,6 +84,7 @@ const empty: Store = {
     spotifyClientId: "",
     googleClientId: "",
     defaultPlaylist: "",
+    defaultPlaylistUri: "",
     schedulerEnabled: true,
     startWithWindows: false,
     startMinimizedToTray: false,
@@ -97,6 +106,8 @@ const dataFile = () =>
   path.join(app.getPath("userData"), "scheduler-data.json");
 const backupDirectory = () => path.join(app.getPath("userData"), "backups");
 const backupSettingsFile = () => path.join(app.getPath("userData"), "backup-settings.json");
+const lanRemotePreference = () => path.join(app.getPath("userData"), "lan-remote-enabled");
+const lanPairings = new LanPairings(() => path.join(app.getPath("userData"), "lan-remote-pairings.json"));
 const brandingDir = () => path.join(app.getPath("userData"), "branding");
 const brandingDefaults = { pharmacyName: "TWC Stafford", pharmacyLogo: "", pharmacyIcon: "" };
 const brandingFile = (name: string) => {
@@ -306,7 +317,7 @@ async function readStore(): Promise<Store> {
       ...(typeof sourceSettings.googleLocationTitle === "string" ? { googleLocationTitle: sourceSettings.googleLocationTitle } : {}),
       ...(typeof sourceSettings.googleLastSync === "string" ? { googleLastSync: sourceSettings.googleLastSync } : {}),
       ...(Number.isInteger(sourceSettings.googleSyncMinutes) ? { googleSyncMinutes: sourceSettings.googleSyncMinutes } : {}),
-      defaultPlaylist: sourceSettings.defaultPlaylist ?? empty.settings.defaultPlaylist,
+      ...defaultPlaylistSettings(sourceSettings.defaultPlaylist ?? "", sourceSettings.defaultPlaylistUri),
       ...(sourceSettings.timezone !== undefined ? { timezone: sourceSettings.timezone } : {}),
       pharmacyName: typeof sourceSettings.pharmacyName === "string" ? sourceSettings.pharmacyName : "TWC Stafford",
       pharmacyLogo: typeof sourceSettings.pharmacyLogo === "string" ? sourceSettings.pharmacyLogo : "",
@@ -542,6 +553,68 @@ let win: BrowserWindow;
 let tray: Tray | null = null;
 let scheduleCoordinator: ScheduleCoordinator | undefined;
 let announcementService: AnnouncementService | undefined;
+const rendererAudio = new RendererAudioActivity();
+const randomAdvertisementTimes = new Map<string, number>();
+let audioResumePending = false;
+let cachedRemoteSchedule: { key: string; summary: ReturnType<typeof remoteScheduleSummary> } | undefined;
+const lanRemote = new LanRemote({
+  pairings: lanPairings,
+  theme: {
+    stylesheet: path.join(app.getAppPath(), app.isPackaged ? "dist/dashboard-theme.css" : "src/style.css"),
+    assetDirectory: path.join(app.getAppPath(), app.isPackaged ? "dist" : "assets"),
+  },
+  brandLogo: async () => {
+    const { settings } = await readStore();
+    const file = brandingFile(String(settings.pharmacyLogo || ""));
+    if (!file) return null;
+    try {
+      const stat = await fs.stat(file);
+      if (!stat.isFile() || stat.size > 5 * 1024 * 1024) return null;
+      const format = path.extname(file).slice(1).toLowerCase().replace("jpg", "jpeg");
+      return { bytes: await fs.readFile(file), mime: `image/${format}` };
+    } catch {
+      return null;
+    }
+  },
+  playback: async () => {
+    if (observedPlayback && Date.now() - observedPlayback.at < 8000) return observedPlayback.value;
+    return currentPlayback();
+  },
+  control: (action, value) => controlSpotifyPlayback(action, value),
+  blocked: async () => {
+    const { settings, schedules } = await readStore();
+    return remotePlaybackBlock(audioActivity(), settings.schedulerEnabled === true && activeQuietSchedules(schedules as any, new Date()).length > 0);
+  },
+  dashboard: async () => {
+    const { settings, schedules, exceptions, playlists, announcements, announcementSchedules, advertisements, advertisementSchedules } = await readStore();
+    const now = new Date();
+    const key = JSON.stringify([Math.floor(now.getTime() / 60_000), now.getTimezoneOffset(), settings.schedulerEnabled,
+      settings.defaultPlaylist, schedules, exceptions, playlists, announcements, announcementSchedules, advertisements,
+      advertisementSchedules, [...randomAdvertisementTimes]]);
+    const previousAction = cachedRemoteSchedule?.summary.nextAction;
+    if (cachedRemoteSchedule?.key !== key || (previousAction && Date.parse(previousAction.at) <= now.getTime())) {
+      cachedRemoteSchedule = { key, summary: remoteScheduleSummary({
+        settings, schedules: schedules as any, exceptions: exceptions as any, playlists: playlists as any,
+        announcements, announcementSchedules, advertisements, advertisementSchedules,
+      }, now, randomAdvertisementTimes) };
+    }
+    const schedule = cachedRemoteSchedule.summary;
+    const activity = audioActivity();
+    const spotify = observedPlayback && Date.now() - observedPlayback.at < 12_000 && spotifyHealth.state === "disconnected"
+      ? "connected" : spotifyHealth.state;
+    return {
+      ...schedule,
+      spotify,
+      brandName: typeof settings.pharmacyName === "string" && settings.pharmacyName.trim() ? settings.pharmacyName : brandingDefaults.pharmacyName,
+      brandLogoRevision: settings.pharmacyLogo
+        ? crypto.createHash("sha256").update(String(settings.pharmacyLogo)).digest("hex").slice(0, 16) : undefined,
+      announcement: activity.announcement,
+      advertisement: activity.advertisement,
+      blocked: remotePlaybackBlock(activity, schedule.quiet),
+    };
+  },
+});
+let observedPlayback: { at: number; value: unknown } | null = null;
 let spotifyMonitorTimer: NodeJS.Timeout | null = null;
 let spotifyHealth: SpotifyMonitorSnapshot = { state: "disconnected", message: "Connect Spotify in Settings.", connected: false };
 let spotifyHealthInFlight: Promise<void> | null = null;
@@ -553,6 +626,7 @@ let shutdownLogging = false;
 let pendingRestore = false;
 let trayFallbackNoticeShown = false;
 type UpdateStatus = { status: "unsupported" | "idle" | "checking" | "current" | "available" | "downloading" | "downloaded" | "installing" | "error"; currentVersion: string; version?: string; percent?: number; message: string };
+let remoteInstaller: RemoteInstaller | null = null;
 let updaterStatus: UpdateStatus = { status: "idle", currentVersion: app.getVersion(), message: "Updates have not been checked yet." };
 let updaterCheckPromise: Promise<void> | null = null;
 let updaterInstallRequested = false;
@@ -788,8 +862,8 @@ function createWindow(showWindow = true) {
     }
   });
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (isApprovedExternalUrl(url)) void shell.openExternal(url).catch(() =>
-      startupLog("[external] Could not open the approved Spotify help page."),
+    if (isApprovedExternalUrl(url) || url === remoteInstaller?.url) void shell.openExternal(url).catch(() =>
+      startupLog("[external] Could not open the approved link."),
     );
     return { action: "deny" };
   });
@@ -830,6 +904,16 @@ function createWindow(showWindow = true) {
   win.webContents.on("render-process-gone", (_event, details) =>
     startupLog(`[renderer] process exited: ${JSON.stringify(details)}`),
   );
+  const clearRendererAudio = () => {
+    randomAdvertisementTimes.clear();
+    if (rendererAudio.clear() && !shutdownLogging) audioResumePending = true;
+    publishAudioActivity();
+  };
+  win.webContents.on("did-start-navigation", details => {
+    if (details.isMainFrame && !details.isSameDocument) clearRendererAudio();
+  });
+  win.webContents.on("render-process-gone", clearRendererAudio);
+  win.webContents.on("destroyed", clearRendererAudio);
   win.webContents.on(
     "console-message",
     (_event, level, message, line, sourceId) => {
@@ -939,6 +1023,11 @@ app
       onStatus: publishAnnouncementStatus,
     });
     announcementService.start();
+    void withStoreMutation(async () => {
+      if (shutdownLogging) return;
+      const enabled = await fs.readFile(lanRemotePreference(), "utf8").catch(() => "");
+      if (!shutdownLogging) await lanRemote.configure(enabled === "enabled");
+    }).catch(() => startupLog("Could not initialize LAN remote access."));
     void spotifyMonitorTick();
     spotifyMonitorTimer = setInterval(() => { void spotifyMonitorTick(); }, 30_000);
     powerMonitor.on("resume", () => void announcementService?.tick("resume"));
@@ -954,7 +1043,7 @@ app.on("before-quit", (event) => {
   event.preventDefault();
   shutdownLogging = true;
   startupLog("Application shutting down; scheduler stopped.");
-  void Promise.all([scheduleCoordinator?.stop(), announcementService?.stop(), backupService?.stop()])
+  void Promise.all([scheduleCoordinator?.stop(), announcementService?.stop(), backupService?.stop(), lanRemote.close()])
     .then(() => addLog("info", "Application stopped; scheduler stopped."))
     .catch((error) =>
       startupLog(`Could not save shutdown log: ${String(error)}`),
@@ -983,6 +1072,17 @@ app.on("will-quit", () => {
 ipcMain.handle("data:load", (event) => {
   assertTrustedSender(event);
   return readStore();
+});
+ipcMain.handle("spotify:set-default-playlist", (event, playlistId: unknown) => {
+  assertTrustedSender(event);
+  if (typeof playlistId !== "string" || !/^[A-Za-z0-9]{22}$/.test(playlistId))
+    throw new Error("Select a valid Spotify playlist.");
+  const selection = defaultPlaylistSettings(playlistId);
+  return withStoreMutation(async () => {
+    const store = await readStore();
+    await writeStore({ ...store, settings: { ...store.settings, ...selection } });
+    return selection;
+  });
 });
 ipcMain.handle("branding:load", async (event) => {
   assertTrustedSender(event);
@@ -1106,7 +1206,7 @@ ipcMain.handle("updater:install", async (event) => {
   autoUpdater.quitAndInstall(true, true);
   return true;
 });
-ipcMain.handle("data:save", async (_e, input, validateOnly = false) => {
+ipcMain.handle("data:save", async (_e, input, validateOnly = false, replaceDefaultPlaylist = false) => {
   assertTrustedSender(_e);
   const validDays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   let serializedSize: number;
@@ -1247,7 +1347,7 @@ ipcMain.handle("data:save", async (_e, input, validateOnly = false) => {
       !validImage
     ) throw new Error("Invalid Spotify playlist data.");
   }
-  const settingKeys = new Set(["schedulerEnabled", "startWithWindows", "startMinimizedToTray", "missedSchedulePolicy", "spotifyClientId", "googleClientId", "googleLocation", "googleLocationTitle", "googleLastSync", "googleSyncMinutes", "defaultPlaylist", "timezone", "pharmacyName", "pharmacyLogo", "pharmacyIcon"]);
+  const settingKeys = new Set(["schedulerEnabled", "startWithWindows", "startMinimizedToTray", "missedSchedulePolicy", "spotifyClientId", "googleClientId", "googleLocation", "googleLocationTitle", "googleLastSync", "googleSyncMinutes", "defaultPlaylist", "defaultPlaylistUri", "timezone", "pharmacyName", "pharmacyLogo", "pharmacyIcon"]);
   if (
     Object.keys(input.settings).some((key) => !settingKeys.has(key)) ||
     typeof input.settings.schedulerEnabled !== "boolean" ||
@@ -1259,6 +1359,8 @@ ipcMain.handle("data:save", async (_e, input, validateOnly = false) => {
     (input.settings.googleClientId !== undefined && (typeof input.settings.googleClientId !== "string" || input.settings.googleClientId.length > 300)) ||
     typeof input.settings.defaultPlaylist !== "string" ||
     input.settings.defaultPlaylist.length > 256 ||
+    (input.settings.defaultPlaylistUri !== undefined &&
+      (typeof input.settings.defaultPlaylistUri !== "string" || input.settings.defaultPlaylistUri.length > 512)) ||
     (input.settings.timezone !== undefined &&
       (typeof input.settings.timezone !== "string" || input.settings.timezone.length > 128))
   )
@@ -1278,7 +1380,9 @@ ipcMain.handle("data:save", async (_e, input, validateOnly = false) => {
         ...(typeof input.settings.googleLocationTitle === "string" ? { googleLocationTitle: input.settings.googleLocationTitle } : {}),
         ...(typeof input.settings.googleLastSync === "string" ? { googleLastSync: input.settings.googleLastSync } : {}),
         ...(Number.isInteger(input.settings.googleSyncMinutes) ? { googleSyncMinutes: input.settings.googleSyncMinutes } : {}),
-        defaultPlaylist: input.settings.defaultPlaylist,
+        ...(replaceDefaultPlaylist === true
+          ? defaultPlaylistSettings(input.settings.defaultPlaylist, input.settings.defaultPlaylistUri)
+          : { defaultPlaylist: current.settings.defaultPlaylist, defaultPlaylistUri: current.settings.defaultPlaylistUri }),
         ...(input.settings.timezone !== undefined ? { timezone: input.settings.timezone } : {}),
         pharmacyName: current.settings.pharmacyName || "TWC Stafford",
         pharmacyLogo: current.settings.pharmacyLogo || "",
@@ -1346,7 +1450,86 @@ async function readAudioFile(kind: "announcements" | "advertisements", id: strin
 }
 function publishAnnouncementStatus(status: AnnouncementServiceStatus) {
   if (win && !win.isDestroyed()) win.webContents.send("announcements:status", status);
+  publishAudioActivity();
 }
+function audioActivity() {
+  return rendererAudio.status(announcementService?.status());
+}
+function assertSpotifyControlsAvailable() {
+  if (audioActivity().blocked || announcementService?.status().busy)
+    throw new Error("Spotify controls are temporarily disabled while an announcement or advertisement is playing.");
+}
+function publishAudioActivity() {
+  const status = audioActivity();
+  if (win && !win.isDestroyed() && !win.webContents.isDestroyed())
+    win.webContents.send("audio:activity", status);
+  if (!shutdownLogging && audioResumePending && !status.blocked && !announcementService?.status().busy) {
+    audioResumePending = false;
+    void resumeSpotifyForAnnouncement().catch(error =>
+      addLog("error", `Spotify could not resume after audio playback: ${redactSecrets(error)}`),
+    );
+  }
+}
+ipcMain.handle("audio:activity", event => {
+  assertTrustedSender(event);
+  return audioActivity();
+});
+ipcMain.handle("lan-remote:installer", async event => {
+  assertTrustedSender(event);
+  remoteInstaller = await findRemoteInstaller();
+  return remoteInstaller;
+});
+ipcMain.handle("lan-remote:status", event => {
+  assertTrustedSender(event);
+  return lanRemote.status();
+});
+ipcMain.handle("lan-remote:revoke-pairings", async event => {
+  assertTrustedSender(event);
+  lanRemote.rotateAccessCode();
+  await lanPairings.revokeAll();
+});
+ipcMain.handle("lan-remote:random-advertisement-times", (event, entries) => {
+  assertTrustedSender(event);
+  if (!Array.isArray(entries) || entries.length > 1000) return;
+  randomAdvertisementTimes.clear();
+  for (const entry of entries) {
+    if (Array.isArray(entry) && typeof entry[0] === "string" && /^[\w-]{36}$/.test(entry[0]) && Number.isSafeInteger(entry[1]))
+      randomAdvertisementTimes.set(entry[0], entry[1]);
+  }
+});
+ipcMain.handle("lan-remote:configure", async (event, enabled) => {
+  assertTrustedSender(event);
+  if (typeof enabled !== "boolean") throw new Error("Invalid LAN remote access preference.");
+  return withStoreMutation(async () => {
+    if (shutdownLogging) throw new Error("The application is shutting down.");
+    if (!enabled) await lanRemote.configure(false);
+    const preference = lanRemotePreference();
+    await fs.writeFile(preference + ".tmp", enabled ? "enabled" : "disabled");
+    await fs.rename(preference + ".tmp", preference);
+    if (enabled && !shutdownLogging) await lanRemote.configure(true);
+    return lanRemote.status();
+  });
+});
+ipcMain.handle("audio:renderer-activity", (event, kind, generation, active, resumeOnExit) => {
+  assertTrustedSender(event);
+  if ((kind !== "announcement" && kind !== "advertisement") || !Number.isSafeInteger(generation) || generation < 1 || typeof active !== "boolean" || typeof resumeOnExit !== "boolean")
+    throw new Error("Invalid audio activity.");
+  if (active) {
+    if (spotifyCommandInFlight) throw new Error("Wait for the Spotify playback command to finish before starting audio.");
+    rendererAudio.start(kind, generation, resumeOnExit);
+  } else {
+    rendererAudio.finish(kind, generation);
+  }
+  publishAudioActivity();
+});
+ipcMain.handle("audio:resume-spotify", async event => {
+  assertTrustedSender(event);
+  if (audioActivity().blocked || announcementService?.status().busy) {
+    audioResumePending = true;
+    return;
+  }
+  await resumeSpotifyForAnnouncement();
+});
 async function playScheduledAnnouncement(event: AnnouncementOccurrence, audio: any, options: { resumeAfter: boolean }) {
   const spotifyConnected = (await spotifyStatus()).connected;
   const customWasPlaying = event.custom && options.resumeAfter && spotifyConnected ? !!(await currentPlayback())?.is_playing : false;
@@ -1423,6 +1606,7 @@ ipcMain.handle("device:info", (event) => {
 });
 ipcMain.handle("spotify:open-desktop", async (event) => {
   assertTrustedSender(event);
+  assertSpotifyControlsAvailable();
   return openSpotifyDesktop();
 });
 ipcMain.handle("window:action", (event, action) => {
@@ -1443,6 +1627,7 @@ ipcMain.handle("spotify:status", (event) => {
 ipcMain.handle("spotify:disconnect", async (event) => {
   assertTrustedSender(event);
   await deleteToken();
+  observedPlayback = null;
   publishSpotifyHealth(classifySpotifyHealth({ authenticated: false }));
   await addLog("info", "Spotify disconnected.");
   return { connected: false, message: "Spotify disconnected." };
@@ -1709,12 +1894,14 @@ async function spotifyRequest(
   method: string,
   endpoint: string,
   body?: unknown,
+  signal?: AbortSignal,
 ): Promise<any | null> {
   try {
     return await requestSpotifyApi({
       method,
       endpoint,
       body,
+      signal,
       getAccessToken: () => validAccessToken(),
       refreshAccessToken: () => validAccessToken(true),
       onUnauthorized: deleteToken,
@@ -1724,8 +1911,8 @@ async function spotifyRequest(
     throw new Error(redactSecrets(error));
   }
 }
-async function freshSpotifyDevices() {
-  const response = await spotifyRequest("GET", "/me/player/devices");
+async function freshSpotifyDevices(signal?: AbortSignal) {
+  const response = await spotifyRequest("GET", "/me/player/devices", undefined, signal);
   if (!Array.isArray(response?.devices)) throw new Error("Spotify did not return a fresh device list.");
   return response.devices;
 }
@@ -1740,8 +1927,11 @@ ipcMain.handle(
   "spotify:control",
   async (event, action: string, value?: number) => {
     assertTrustedSender(event);
-    const announcementState = announcementService?.status();
-    if (announcementState?.busy || announcementState?.active || announcementState?.windowActive) throw new Error("Spotify controls are paused while a scheduled announcement is active.");
+    return controlSpotifyPlayback(action, value, stage => event.sender.send("spotify:playback-stage", { stage }));
+  },
+);
+async function controlSpotifyPlayback(action: string, value?: number, onStage?: (stage: string) => void) {
+    assertSpotifyControlsAvailable();
     if (spotifyCommandInFlight) throw new Error("A Spotify playback command is already running. Wait for it to finish before sending another command.");
     spotifyCommandInFlight = Promise.resolve();
     try {
@@ -1759,16 +1949,54 @@ ipcMain.handle(
         const started = await startSpotifyPlayback({
           getPlayback: async () => await spotifyRequest("GET", "/me/player"),
           getDevices: freshSpotifyDevices,
-          transfer: async deviceId => { const command = transferPlaybackCommand(deviceId); await spotifyRequest(command.method, command.endpoint, command.body); },
-          play: async deviceId => { const command = playbackCommand("play", deviceId); await spotifyRequest(command.method, command.endpoint); },
+          transfer: async deviceId => {
+            assertSpotifyControlsAvailable();
+            const command = transferPlaybackCommand(deviceId);
+            await spotifyRequest(command.method, command.endpoint, command.body);
+          },
+          play: async deviceId => {
+            assertSpotifyControlsAvailable();
+            const command = playbackCommand("play", deviceId);
+            await spotifyRequest(command.method, command.endpoint);
+          },
           onDevices: (devices, stage) => logSpotifyDeviceSnapshot(devices, stage, "manual playback start"),
-          onStage: stage => event.sender.send("spotify:playback-stage", { stage }),
+          onStage,
         });
         await addLog("info", `Manual playback start accepted on an active Spotify device (device ID present: yes; transferred: ${started.transferred}).`);
         const confirmed = await currentPlayback();
         await addLog("info", `Spotify playback verification result: play ${confirmed?.is_playing ? "confirmed" : "not confirmed"}.`);
         if (!confirmed?.is_playing) throw new Error("Spotify accepted Play, but playback could not be confirmed.");
         return confirmed;
+      }
+      if (action === "pause") {
+        let state;
+        let device;
+        try {
+          state = await spotifyRequest("GET", "/me/player");
+          // The player response identifies the device associated with is_playing.
+          device = state?.device
+            ? usableDevice(state)
+            : state?.is_playing ? null : usableDevice(state, await freshSpotifyDevices());
+        } catch (error) {
+          if (isSpotifyConnectionError(error))
+            throw new Error(`Spotify connection lost before Pause could be sent. ${String(error)}`);
+          throw error;
+        }
+        if (!device) throw new Error("No usable Spotify playback device is available to pause.");
+        assertSpotifyControlsAvailable();
+        const confirmed = await pauseSpotifyPlayback(device.id, {
+          pause: id => {
+            const command = playbackCommand("pause", id);
+            return spotifyRequest(command.method, command.endpoint);
+          },
+          getPlayback: signal => spotifyRequest("GET", "/me/player", undefined, signal),
+          getDevices: freshSpotifyDevices,
+          onAccepted: () => {
+            void addLog("info", "Spotify accepted Pause. Waiting for the selected device to confirm playback has paused.");
+          },
+        });
+        await addLog("info", "Spotify playback verification result: pause confirmed.");
+        return observePlayback(confirmed, []);
       }
       const playback = await currentPlayback();
       const deviceId =
@@ -1779,6 +2007,7 @@ ipcMain.handle(
         throw new Error(
           "Spotify is connected, but no usable playback device is available. Open Spotify, wait for it to appear in Available Devices, then try again.",
         );
+      assertSpotifyControlsAvailable();
       if (
         action === "volume" &&
         Number.isInteger(value) &&
@@ -1794,8 +2023,6 @@ ipcMain.handle(
           `/me/player/volume?volume_percent=${value}&device_id=${encodeURIComponent(deviceId)}`,
         );
       } else if (
-        action === "play" ||
-        action === "pause" ||
         action === "previous" ||
         action === "next"
       ) {
@@ -1807,11 +2034,11 @@ ipcMain.handle(
         `Spotify playback command completed: ${action}${action === "volume" ? ` ${value}%` : ""}.`,
       );
       const confirmed = await currentPlayback();
-      if (action === "pause" && confirmed?.is_playing) throw new Error("Spotify accepted Pause, but playback is still active.");
-      await addLog("info", `Spotify playback verification result: ${action} ${action === "pause" ? (!confirmed?.is_playing ? "confirmed" : "not confirmed") : "state refreshed"}.`);
+      if (action === "volume") lanRemote.updatePlayback(confirmed);
+      await addLog("info", `Spotify playback verification result: ${action} state refreshed.`);
       return confirmed;
     } catch (e) {
-      if (action === "play") event.sender.send("spotify:playback-stage", { stage: "playback-failed" });
+      if (action === "play") onStage?.("playback-failed");
       await addLog(
         "error",
         `Spotify playback command failed (${action}): ${String(e)}`,
@@ -1820,8 +2047,7 @@ ipcMain.handle(
     } finally {
       spotifyCommandInFlight = null;
     }
-  },
-);
+}
 async function currentPlayback() {
   const state = await spotifyRequest("GET", "/me/player");
   let devices: any[] = [];
@@ -1835,8 +2061,17 @@ async function currentPlayback() {
     // A current active state is still useful if refreshing the device list fails.
     if (!state) throw error;
   }
+  return observePlayback(state, devices);
+}
+function observePlayback(state: any, devices: any[]) {
+  const value = playbackSnapshot(state, devices);
+  observedPlayback = { at: Date.now(), value };
+  return value;
+}
+function playbackSnapshot(state: any, devices: any[]) {
   const selected = usableDevice(state, devices);
   if (!state && !selected) return null;
+  const activeDeviceName = activePlaybackDeviceName(state, devices);
   const stateDeviceId = state?.device?.id;
   const sameActiveDevice =
     !!selected && selected.id === stateDeviceId && !!state?.device?.is_active;
@@ -1849,12 +2084,13 @@ async function currentPlayback() {
     return {
       is_playing: false,
       device,
+      activeDeviceName,
       item: null,
       actions: { disallows: {} },
     };
   // Preserve Spotify's reported playing state even if the device endpoint is briefly stale.
-  if (!sameActiveDevice) return { ...state, device };
-  return { ...state, device, actions: state.actions };
+  if (!sameActiveDevice) return { ...state, device, activeDeviceName };
+  return { ...state, device, activeDeviceName, actions: state.actions };
 }
 function publishSpotifyHealth(next: SpotifyMonitorSnapshot) {
   const changed = next.state !== spotifyHealth.state || next.deviceKey !== spotifyHealth.deviceKey;
@@ -1876,6 +2112,7 @@ async function spotifyMonitorTick() {
       const response = await spotifyRequest("GET", "/me/player/devices");
       const devices = Array.isArray(response?.devices) ? response.devices : [];
       const playback = await spotifyRequest("GET", "/me/player");
+      observePlayback(playback, devices);
       const next = classifySpotifyHealth({ authenticated: true, devices });
       publishSpotifyHealth(next);
       if (next.state === "no-playback-device") await addLog("warn", "Spotify has no available controllable playback device.");
@@ -1893,12 +2130,22 @@ async function recoverUnexpectedPlaybackStop() {
   const now = new Date(), day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][now.getDay()];
   const store = await readStore();
   const announcement = announcementService?.status();
+  if (rendererAudio.status().blocked) return;
   const minute = now.getHours() * 60 + now.getMinutes();
   const schedule = (store.schedules as any[]).find(item => !item.quiet && item.enabled !== false && item.days?.includes(day) && /^\d{2}:\d{2}$/.test(item.start) && /^\d{2}:\d{2}$/.test(item.end) && minute >= Number(item.start.slice(0, 2)) * 60 + Number(item.start.slice(3)) && minute < Number(item.end.slice(0, 2)) * 60 + Number(item.end.slice(3)) && typeof item.playlistId === "string");
   if (!shouldRecoverUnexpectedStop({ previouslyPlaying: monitorPreviouslyPlaying === true, currentlyPlaying: false, schedulerEnabled: store.settings.schedulerEnabled === true, quiet: activeQuietSchedules(store.schedules as any, now).length > 0, announcementBusy: !!(announcement?.busy || announcement?.active), announcementWindowActive: !!announcement?.windowActive, activeMusicSchedule: !!schedule })) return;
   try {
+    const [hour, minutes] = schedule.start.split(":").map(Number);
+    const start = new Date(now);
+    start.setHours(hour, minutes, 0, 0);
+    const event = boundariesAt([schedule], start).find(item => item.boundary === "start");
+    if (!event) return;
+    const exception = scheduleExceptionFor(event, store.exceptions as any);
+    if (exception?.type === "skip") return;
+    const playlistUri = scheduledPlaylistUri(store.settings, schedule.playlistId, exception?.type === "replace" ? exception.playlistId : undefined);
     await verifyScheduledPlaybackScopes();
-    await startScheduledPlayback({ playlistId: schedule.playlistId, getPlayback: async () => await spotifyRequest("GET", "/me/player"), getDevices: freshSpotifyDevices, transfer: async deviceId => { const command = transferPlaybackCommand(deviceId); await spotifyRequest(command.method, command.endpoint, command.body); }, play: async (deviceId, playlistUri) => { const command = playlistPlaybackCommand(playlistUri!, deviceId); await spotifyRequest(command.method, command.endpoint, command.body); }, onDevices: (devices, stage) => logSpotifyDeviceSnapshot(devices, stage, "monitor recovery"), onStage: () => undefined });
+    await startScheduledPlayback({ playlistId: playlistUri, getPlayback: async () => await spotifyRequest("GET", "/me/player"), getDevices: freshSpotifyDevices, transfer: async deviceId => { const command = transferPlaybackCommand(deviceId); await spotifyRequest(command.method, command.endpoint, command.body); }, play: async (deviceId, playlistUri) => { const command = playlistPlaybackCommand(playlistUri!, deviceId); await spotifyRequest(command.method, command.endpoint, command.body); }, onDevices: (devices, stage) => logSpotifyDeviceSnapshot(devices, stage, "monitor recovery"), onStage: () => undefined });
+    scheduleCoordinator?.recordRecoveredPlaylist(event.key, playlistUri);
     await addLog("info", `Spotify playback recovered for the active scheduled playlist "${String(schedule.name || "Music schedule").slice(0, 100)}" after an unexpected stop.`);
   } catch (error) { await addLog("error", `Spotify playback recovery failed: ${redactSecrets(error)}`); }
 }
@@ -1928,6 +2175,10 @@ async function pauseIfPlaying(maxAttempts = 3) {
   throw lastError instanceof Error ? lastError : new Error(`Spotify pause command failed after ${maxAttempts} verification attempt${maxAttempts === 1 ? "" : "s"}.`);
 }
 async function resumeSpotifyForAnnouncement() {
+  if (rendererAudio.status().blocked) {
+    audioResumePending = true;
+    return;
+  }
   const state = await currentPlayback();
   if (state?.is_playing) return;
   await verifyScheduledPlaybackScopes();
@@ -2017,10 +2268,7 @@ async function restoreQuietSnapshot() {
     }
   }
 }
-async function executeScheduleBoundary(event: {
-  schedule: any;
-  boundary: "start" | "end";
-}): Promise<void | { skipped: string }> {
+async function executeScheduleBoundary(event: Boundary): Promise<void | { skipped: string } | { playlistUri: string }> {
   const { schedule, boundary } = event;
   if (schedule.quiet) {
     if (boundary === "start") {
@@ -2037,20 +2285,20 @@ async function executeScheduleBoundary(event: {
     return;
   }
   const announcementState = announcementService?.status();
-  if (boundary === "start" && (announcementState?.busy || announcementState?.active || announcementState?.windowActive)) {
-    await addLog("info", `Skipped scheduled playback for ${schedule.name} because an announcement is active.`);
-    return { skipped: "An announcement is active." };
+  if (boundary === "start" && (announcementState?.busy || audioActivity().blocked)) {
+    await addLog("info", `Skipped scheduled playback for ${schedule.name} because an announcement or advertisement is active.`);
+    return { skipped: "An announcement or advertisement is active." };
   }
   if (boundary === "start") {
-    if (activeQuietSchedules((await readStore()).schedules as any, new Date()).length) {
+    const store = await readStore();
+    if (activeQuietSchedules(store.schedules as any, new Date()).length) {
       await addLog("info", `Skipped scheduled playback for ${schedule.name} because a No Playback schedule is active.`);
       return { skipped: "An active Quiet Hours schedule blocked playback." };
     }
-    if (!schedule.playlistId)
-      throw new Error("This schedule has no Spotify playlist assigned.");
+    const playlistUri = scheduledPlaylistUri(store.settings, schedule.playlistId, event.overridePlaylistId);
     await verifyScheduledPlaybackScopes();
     const result = await startScheduledPlayback({
-      playlistId: schedule.playlistId,
+      playlistId: playlistUri,
       getPlayback: async () => await spotifyRequest("GET", "/me/player"),
       getDevices: freshSpotifyDevices,
       transfer: async deviceId => {
@@ -2060,14 +2308,21 @@ async function executeScheduleBoundary(event: {
       onDevices: (devices, stage) => logSpotifyDeviceSnapshot(devices, stage, "scheduled start"),
       play: async (deviceId, playlistUri) => {
         const command = playlistPlaybackCommand(playlistUri, deviceId);
-        await spotifyRequest(command.method, command.endpoint, command.body);
+        try {
+          await spotifyRequest(command.method, command.endpoint, command.body);
+        } catch (error) {
+          if (/\((403|404)\)/.test(String(error))) {
+            throw new Error(`Spotify could not start the selected playlist. Check that the connected account can play it. ${String(error)}`);
+          }
+          throw error;
+        }
       },
     });
     await addLog("info", `Scheduled playback started and was confirmed on an active Spotify device (device ID present: yes; transferred: ${result.transferred}).`);
-    return;
+    return { playlistUri };
   }
   const state = await currentPlayback();
-  const expected = `spotify:playlist:${schedule.playlistId}`;
+  const expected = event.startedPlaylistUri || (schedule.playlistId && spotifyPlaylistUri(schedule.playlistId));
   if (state?.is_playing && state.context?.uri === expected)
     await pauseIfPlaying(1);
 }

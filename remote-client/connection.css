@@ -1,0 +1,19 @@
+* { box-sizing: border-box; }
+:root { font: 14px "Segoe UI", sans-serif; background: #f6f8fc; color: #111f39; }
+body { margin: 0; padding: 10px 18px; border-bottom: 1px solid #e5eaf1; }
+label { display: block; margin-bottom: 5px; font-weight: 600; }
+.controls { display: flex; gap: 8px; max-width: 550px; }
+input, button { min-height: 37px; padding: 5px 11px; border-radius: 9px; font: inherit; }
+input { flex: 1; min-width: 0; border: 1px solid #8190a8; }
+button { border: 1px solid #287eff; background: #287eff; color: #fff; cursor: pointer; }
+button:disabled { opacity: .65; cursor: wait; }
+.secondary { background: #fff; color: #1769d2; }
+#pairing { margin-top: 10px; }
+#pairing input { width: min(100%, 360px); }
+input:focus-visible, button:focus-visible { outline: 2px solid #251d51; outline-offset: 2px; }
+p { margin: 5px 0 0; overflow-wrap: anywhere; }
+.note { color: #52647f; font-size: 12px; }
+#client-update { margin-bottom: 8px; }
+#client-update p { margin: 0 0 4px; }
+#update-progress { width: min(100%, 240px); }
+#status[data-error="true"] { color: #9c3c2a; }

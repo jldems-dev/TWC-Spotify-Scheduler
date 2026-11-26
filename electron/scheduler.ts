@@ -3,10 +3,10 @@ import path from 'node:path';
 
 export type ScheduledEntry = { id: string; name: string; days: string[]; dates?: string[]; date?: string; repeat?: 'never' | 'daily' | 'weekly' | 'monthly' | 'yearly'; start: string; end: string; playlistId?: string; enabled: boolean; quiet: boolean };
 export type ScheduleException = { date: string; type: 'skip' | 'replace'; playlistId?: string; label?: string; scheduleId?: string };
-export type Boundary = { schedule: ScheduledEntry; boundary: 'start' | 'end'; key: string };
+export type Boundary = { schedule: ScheduledEntry; boundary: 'start' | 'end'; key: string; overridePlaylistId?: string; startedPlaylistUri?: string };
 export type MissedSchedulePolicy = 'skip' | 'latest-within-5-minutes';
 type EventStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
-type LedgerEvent = { status: EventStatus; updatedAt: string; attempts: number; error?: string; retryable?: boolean };
+type LedgerEvent = { status: EventStatus; updatedAt: string; attempts: number; error?: string; retryable?: boolean; playlistUri?: string };
 type Ledger = Record<string, LedgerEvent>;
 const RECOVERY_GRACE_MS = 5 * 60_000;
 const MAX_MISSED_SCAN_MS = 7 * 24 * 60 * 60_000;
@@ -69,6 +69,14 @@ export function boundariesBetween(schedules: ScheduledEntry[], after: Date, thro
   }
   return [...found.values()];
 }
+export function scheduleExceptionFor<T extends ScheduleException>(event: Boundary, exceptions: T[]) {
+  const at = scheduledAt(event.key, new Date());
+  if (event.boundary === 'end' && event.schedule.end <= event.schedule.start)
+    at.setDate(at.getDate() - 1);
+  const date = localDateKey(at);
+  return exceptions.find(item => item.date === date && item.scheduleId === event.schedule.id)
+    || exceptions.find(item => item.date === date && !item.scheduleId);
+}
 export function activeQuietSchedules(schedules: ScheduledEntry[], now: Date): ScheduledEntry[] {
   const yesterdayDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
   const inside = (startDate: Date, overnight: boolean, s: ScheduledEntry) => {
@@ -86,7 +94,7 @@ export function activeQuietSchedules(schedules: ScheduledEntry[], now: Date): Sc
 type CoordinatorOptions = {
   stateFile: string;
   getSchedules: () => Promise<{ settings: Record<string, unknown>; schedules: ScheduledEntry[]; exceptions?: ScheduleException[] }>;
-  execute: (event: Boundary) => Promise<void | { skipped: string }>;
+  execute: (event: Boundary) => Promise<void | { skipped: string } | { playlistUri: string }>;
   recoverQuiet: (schedule: ScheduledEntry) => Promise<void>;
   enforceQuiet: (schedule: ScheduledEntry) => Promise<boolean>;
   log: (level: 'info' | 'warn' | 'error', message: string) => Promise<void>;
@@ -94,7 +102,7 @@ type CoordinatorOptions = {
   wait?: (milliseconds: number) => Promise<void>;
 };
 const wait = (milliseconds: number) => new Promise<void>(resolve => setTimeout(resolve, milliseconds));
-function scheduledAt(key: string, fallback: Date) {
+export function scheduledAt(key: string, fallback: Date) {
   const match = key.match(/:(\d{4})-(\d{2})-(\d{2}):(\d{2}):(\d{2})$/);
   return match ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5])) : fallback;
 }
@@ -107,6 +115,7 @@ function normalizeEvent(value: any): LedgerEvent {
     updatedAt: typeof value?.updatedAt === 'string' ? value.updatedAt : 'unknown',
     attempts: Number.isInteger(value?.attempts) && value.attempts >= 0 ? value.attempts : status === 'running' || status === 'failed' ? 1 : 0,
     ...(typeof value?.error === 'string' ? { error: value.error.slice(0, 500) } : {}),
+    ...(/^spotify:playlist:[A-Za-z0-9]{22}$/.test(value?.playlistUri) ? { playlistUri: value.playlistUri } : {}),
     ...(typeof value?.retryable === 'boolean' ? { retryable: value.retryable } : {}),
   };
 }
@@ -127,6 +136,7 @@ export class ScheduleCoordinator {
   private lastTickFailure = '';
   private lastTickFailureAt = 0;
   private inFlight = new Set<string>();
+  private recoveredPlaylist?: { startKey: string; uri: string };
   private stopWaiters: Array<() => void> = [];
   constructor(private options: CoordinatorOptions) {}
   start() { if (this.running) return; this.shuttingDown = false; this.running = true; void this.tick('startup'); this.timer = setInterval(() => void this.tick('poll'), 5000); }
@@ -156,6 +166,9 @@ export class ScheduleCoordinator {
       this.busy = false;
       for (const resolve of this.stopWaiters.splice(0)) resolve();
     }
+  }
+  recordRecoveredPlaylist(startKey: string, uri: string) {
+    this.recoveredPlaylist = { startKey, uri };
   }
   private async tickOnce(reason: 'startup' | 'wake' | 'poll') {
     try {
@@ -187,7 +200,7 @@ export class ScheduleCoordinator {
           continue;
         }
         const effective = !event.schedule.quiet && exception?.type === 'replace' && exception.playlistId
-          ? { ...event, schedule: { ...event.schedule, playlistId: exception.playlistId } } : event;
+          ? { ...event, overridePlaylistId: exception.playlistId, schedule: { ...event.schedule, playlistId: exception.playlistId } } : event;
         await this.claimAndExecute(effective);
       }
 
@@ -203,7 +216,10 @@ export class ScheduleCoordinator {
           || existing?.status === 'failed' && existing.retryable && existing.attempts < MAX_ATTEMPTS;
         // Recover interrupted/retryable operations only inside the bounded window; execution paths reconcile Spotify state first.
         if (interruptedOrRetryable && now.getTime() - scheduledAt(event.key, now).getTime() <= RECOVERY_GRACE_MS) {
-          await this.executeBoundary(event);
+          const exception = this.exceptionFor(event, exceptions);
+          const effective = !event.schedule.quiet && exception?.type === 'replace' && exception.playlistId
+            ? { ...event, overridePlaylistId: exception.playlistId, schedule: { ...event.schedule, playlistId: exception.playlistId } } : event;
+          await this.executeBoundary(effective);
           continue;
         }
         if (existing?.status === 'running' || existing?.status === 'pending') {
@@ -221,7 +237,7 @@ export class ScheduleCoordinator {
             await this.markSkipped(event.key, `Date exception ${exception.date} skips this recovered start.`, `Skipped recovered playback for ${event.schedule.name} due to date exception.`);
           } else {
             const effective = exception?.type === 'replace' && exception.playlistId
-              ? { ...event, schedule: { ...event.schedule, playlistId: exception.playlistId } } : event;
+              ? { ...event, overridePlaylistId: exception.playlistId, schedule: { ...event.schedule, playlistId: exception.playlistId } } : event;
             await this.options.log('warn', `Recovering the latest missed start for ${event.schedule.name}; it is ${Math.floor((now.getTime() - scheduledAt(event.key, now).getTime()) / 1000)} seconds late.`);
             await this.claimAndExecute(effective);
           }
@@ -254,10 +270,7 @@ export class ScheduleCoordinator {
     }
   }
   private exceptionFor(event: Boundary, exceptions: ScheduleException[]) {
-    const overnightEnd = event.boundary === 'end' && event.schedule.end <= event.schedule.start;
-    const occurrenceDate = overnightEnd ? new Date(scheduledAt(event.key, new Date()).getFullYear(), scheduledAt(event.key, new Date()).getMonth(), scheduledAt(event.key, new Date()).getDate() - 1) : scheduledAt(event.key, new Date());
-    return exceptions.find(item => item.date === localDateKey(occurrenceDate) && item.scheduleId === event.schedule.id)
-      || exceptions.find(item => item.date === localDateKey(occurrenceDate) && !item.scheduleId);
+    return scheduleExceptionFor(event, exceptions);
   }
   private async readLedger(): Promise<Ledger> {
     try {
@@ -353,7 +366,14 @@ export class ScheduleCoordinator {
       let attempts = previous?.attempts || 0;
       const actual = this.options.now?.() || new Date();
       const scheduled = scheduledAt(key, actual);
-      const playlist = event.schedule.quiet ? 'none (quiet hours)' : event.schedule.playlistId || 'unassigned';
+      if (event.boundary === 'end' && !event.schedule.quiet) {
+        const start = new Date(scheduled);
+        if (event.schedule.end <= event.schedule.start) start.setDate(start.getDate() - 1);
+        const startKey = `${event.schedule.id}:start:${localDateKey(start)}:${event.schedule.start}`;
+        const startedPlaylistUri = this.recoveredPlaylist?.startKey === startKey
+          ? this.recoveredPlaylist.uri : ledger[startKey]?.playlistUri;
+        if (startedPlaylistUri) event = { ...event, startedPlaylistUri };
+      }
       if (!previous) {
         await this.setEvent(key, { status: 'pending', updatedAt: new Date().toISOString(), attempts: 0 });
       } else if (previous.status === 'running') {
@@ -362,15 +382,17 @@ export class ScheduleCoordinator {
       while (attempts < MAX_ATTEMPTS) {
         attempts++;
         await this.setEvent(key, { status: 'running', updatedAt: new Date().toISOString(), attempts });
-        await this.options.log('info', `Schedule attempt ${attempts}/${MAX_ATTEMPTS}: ${event.schedule.name} ${event.boundary}; scheduled local ${localDateKey(scheduled)} ${localTime(scheduled)}; actual local ${localDateKey(actual)} ${localTime(actual)}; playlist ${playlist}.`);
+        await this.options.log('info', `Schedule attempt ${attempts}/${MAX_ATTEMPTS}: ${event.schedule.name} ${event.boundary}; scheduled local ${localDateKey(scheduled)} ${localTime(scheduled)}; actual local ${localDateKey(actual)} ${localTime(actual)}.`);
         try {
           const result = await this.options.execute(event);
-          if (result && typeof result.skipped === 'string') {
+          if (result && typeof result === 'object' && 'skipped' in result) {
             await this.setEvent(key, { status: 'skipped', updatedAt: new Date().toISOString(), attempts, error: result.skipped.slice(0, 500) });
             await this.options.log('warn', `Schedule event skipped: ${event.schedule.name} ${event.boundary}; ${result.skipped}.`);
             return;
           }
-          await this.setEvent(key, { status: 'completed', updatedAt: new Date().toISOString(), attempts });
+          const playlistUri = result && typeof result === 'object' && 'playlistUri' in result ? result.playlistUri : undefined;
+          await this.setEvent(key, { status: 'completed', updatedAt: new Date().toISOString(), attempts, playlistUri });
+          const playlist = event.schedule.quiet ? 'none (quiet hours)' : playlistUri || event.startedPlaylistUri || event.schedule.playlistId || 'unassigned';
           await this.options.log('info', `Schedule result: ${event.schedule.name} ${event.boundary} completed; playlist ${playlist}.`);
           return;
         } catch (error) {

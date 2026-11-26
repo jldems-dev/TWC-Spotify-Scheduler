@@ -1893,7 +1893,9 @@ svg {
 .settings-tab-panel .spotify-connection-layout { display: grid; gap: 12px; }
 .settings-tab-panel .spotify-connection-status { display: flex; align-items: center; gap: 10px; min-width: 0; color: #5c6f8a; font-size: 13px; }
 .settings-tab-panel .spotify-connection-status > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.settings-tab-panel .lan-remote-actions,
 .settings-tab-panel .spotify-connection-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.settings-tab-panel .lan-remote-actions button,
 .settings-tab-panel .spotify-connection-actions button { margin: 0; }
 .settings-tab-panel .google-connection-layout { display: grid; gap: 12px; margin-top: 12px; }
 .settings-tab-panel .google-connection-status { display: flex; align-items: center; gap: 10px; min-width: 0; }

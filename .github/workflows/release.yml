@@ -58,7 +58,7 @@ jobs:
         run: npm run release:win
         working-directory: source
 
-      - name: Upload updater release assets
+      - name: Upload Windows release assets
         shell: pwsh
         working-directory: source
         env:
@@ -76,66 +76,47 @@ jobs:
             throw "Build output is missing required asset(s): $($missingFiles -join ', ')"
           }
 
+          $assetPaths = @($assets | ForEach-Object { $_.FullName })
           gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json tagName 2>$null | Out-Null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $env:RELEASE_TAG `
+            gh release create $env:RELEASE_TAG @assetPaths `
               --repo $env:GITHUB_REPOSITORY `
               --verify-tag `
               --title $env:RELEASE_TAG `
+              --notes "Windows installer for TWC Spotify Scheduler." `
               --generate-notes
             if ($LASTEXITCODE -ne 0) { throw "Could not create GitHub Release $env:RELEASE_TAG." }
+          } else {
+            & gh release upload $env:RELEASE_TAG @assetPaths --repo $env:GITHUB_REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { throw "GitHub CLI failed to upload assets for $env:RELEASE_TAG." }
           }
-
-          $assetPaths = @($assets | ForEach-Object { $_.FullName })
-          & gh release upload $env:RELEASE_TAG @assetPaths --repo $env:GITHUB_REPOSITORY --clobber
-          if ($LASTEXITCODE -ne 0) { throw "GitHub CLI failed to upload assets for $env:RELEASE_TAG." }
           Write-Host "Uploaded $($assets.Name -join ', ') to $env:GITHUB_REPOSITORY release $env:RELEASE_TAG."
 
-      - name: Verify updater release assets
+      - name: Verify downloaded release assets
         shell: pwsh
         working-directory: source
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_API_URL: ${{ github.api_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          $releaseUri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases/tags/$([uri]::EscapeDataString($env:RELEASE_TAG))"
-          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
-          $deadline = (Get-Date).AddMinutes(2)
-          do {
-            try {
-              $release = Invoke-RestMethod -Uri $releaseUri -Headers $headers -Method Get
-              $assets = @($release.assets | ForEach-Object { $_.name })
-              $hasLatest = $assets -contains 'latest.yml'
-              $installer = @($assets | Where-Object { $_ -match '^TWC-Stafford-Music-Scheduler-Setup-[0-9]+\.[0-9]+\.[0-9]+\.exe$' } | Select-Object -First 1)
-              $hasInstaller = $installer.Count -gt 0
-              $hasBlockmap = $installer.Count -gt 0 -and $assets -contains "$($installer[0]).blockmap"
-              if ($hasLatest -and $hasInstaller -and $hasBlockmap) {
-                Write-Host "Verified latest.yml, $($installer[0]), and its blockmap for $env:RELEASE_TAG."
-                exit 0
-              }
-              $missing = @()
-              if (-not $hasLatest) { $missing += 'latest.yml' }
-              if (-not $hasInstaller) { $missing += 'versioned Windows installer EXE' }
-              if ($hasInstaller -and -not $hasBlockmap) { $missing += "$($installer[0]).blockmap" }
-              Write-Host "Waiting for missing release assets: $($missing -join ', '). Uploaded assets: $($assets -join ', ')"
-            } catch { Write-Host "Waiting for release assets: $($_.Exception.Message)" }
-            Start-Sleep -Seconds 5
-          } while ((Get-Date) -lt $deadline)
-          $finalAssets = @()
-          try {
-            $release = Invoke-RestMethod -Uri $releaseUri -Headers $headers -Method Get
-            $finalAssets = @($release.assets | ForEach-Object { $_.name })
-          } catch {
-            throw "Could not verify release $env:RELEASE_TAG at $releaseUri after waiting for uploads: $($_.Exception.Message)"
+          $version = $env:RELEASE_TAG.Substring(1)
+          $installer = "TWC-Stafford-Music-Scheduler-Setup-$version.exe"
+          $localFiles = @(
+            "release/$installer",
+            "release/$installer.blockmap",
+            'release/latest.yml'
+          )
+          $downloadDir = Join-Path $env:RUNNER_TEMP "windows-assets-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $patterns = @($localFiles | ForEach-Object { '--pattern'; Split-Path -Leaf $_ })
+          & gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir $downloadDir @patterns
+          if ($LASTEXITCODE -ne 0) { throw "Could not download release assets for $env:RELEASE_TAG." }
+
+          foreach ($localFile in $localFiles) {
+            $name = Split-Path -Leaf $localFile
+            $download = Join-Path $downloadDir $name
+            $expected = (Get-FileHash -LiteralPath $localFile -Algorithm SHA256).Hash
+            $actual = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
+            if ($actual -cne $expected) { throw "SHA-256 mismatch for $name." }
+            Write-Host "Verified SHA-256 for $name."
           }
-          $missing = @()
-          if ($finalAssets -notcontains 'latest.yml') { $missing += 'latest.yml' }
-          $finalInstaller = @($finalAssets | Where-Object { $_ -match '^TWC-Stafford-Music-Scheduler-Setup-[0-9]+\.[0-9]+\.[0-9]+\.exe$' } | Select-Object -First 1)
-          if ($finalInstaller.Count -eq 0) {
-            $missing += 'versioned Windows installer EXE'
-          } elseif ($finalAssets -notcontains "$($finalInstaller[0]).blockmap") {
-            $missing += "$($finalInstaller[0]).blockmap"
-          }
-          throw "Release $env:RELEASE_TAG is missing required updater asset(s): $($missing -join ', '). Uploaded assets: $($finalAssets -join ', ')"

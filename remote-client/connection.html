@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; form-action 'none'; base-uri 'none'">
+  <title>TWC Spotify Client</title>
+  <link rel="stylesheet" href="connection.css">
+  <script src="connection.js" defer></script>
+</head>
+<body>
+  <section id="client-update" aria-label="Client update" hidden>
+    <p id="update-status" role="status"></p>
+    <progress id="update-progress" max="100" hidden></progress>
+    <div class="controls">
+      <button id="update-action" type="button" hidden></button>
+      <button id="update-later" class="secondary" type="button" hidden>Later</button>
+    </div>
+  </section>
+  <form id="server-form">
+    <label for="server">Scheduler Server Address</label>
+    <div class="controls">
+      <input id="server" maxlength="64" placeholder="192.168.1.20:38942" spellcheck="false" autocomplete="off" required>
+      <button type="submit">Connect</button>
+      <button id="forget" class="secondary" type="button" hidden>Forget server</button>
+    </div>
+    <div id="pairing">
+      <label for="access-code">Access code from PC 1</label>
+      <input id="access-code" type="password" maxlength="43" autocomplete="off" required>
+    </div>
+  </form>
+  <p id="status" role="status">Disconnected</p>
+  <p class="note">Use the address shown in PC 1’s LAN Remote settings on a trusted private network.</p>
+</body>
+</html>

@@ -44,6 +44,16 @@ The audio test generates a short tone through Chromium's Windows default audio o
 
 Electron uses context isolation, disabled Node integration, and a sandboxed preload with narrowly scoped IPC methods. IPC checks the sender, navigation is restricted to the app, and a Content Security Policy is configured. Store writes are serialized and use temporary-file rename. PKCE state and the loopback callback origin are validated. Tokens are encrypted with Windows secure storage and are never returned to the renderer. The app enforces a single instance and stops its scheduler when quitting.
 
+## TWC Spotify Client
+
+On the Scheduler computer, open **Settings ? LAN Remote** and enable LAN remote access. The same settings tab shows the latest published Client version, its Windows download link, and the installer SHA-256.
+
+On another Windows computer on the same trusted network, run the Client installer and open **TWC Spotify Client**. Enter the Scheduler Server Address and access code shown in the Scheduler's LAN Remote settings. The Client stores the pairing with Windows secure storage and reconnects when it is opened again.
+
+Build the independent Client installer with `npm run package:remote:win`. It produces `release-remote/TWC Spotify Client Setup.exe`. The Client has its own version in `remote-client/package.json`. Its release workflow runs for a matching `client-v<version>` tag and publishes `TWC-Spotify-Client-Setup.exe` and `client.yml` without marking that release as the repository?s latest Scheduler release. The Scheduler continues to use its own `v<version>` tags and `latest.yml`.
+
+The installed Client checks GitHub on startup. When it offers an update, choose **Download update**, then **Install and restart**, or choose **Later**. Keep using the same Windows account so the Client can read the saved pairing. Install the first updater-enabled Client manually when upgrading from a version that does not check for updates.
+
 ## Testing and packaging
 
 `npm test` compiles the Electron process modules and runs schedule, local-time display, overnight quiet interval, exception behavior, quiet playback snapshot/restore policy, duplicate event claim, OAuth callback validation, and Spotify error-format tests. `npm run build` type-checks and builds the renderer and Electron process. Live Spotify behavior requires the user's configured Spotify Client ID, authorization, Premium eligibility, and an active device; those external workflows must be verified on the target PC.

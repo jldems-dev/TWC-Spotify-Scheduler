@@ -1,8 +1,14 @@
 import { contextBridge, ipcRenderer } from 'electron';
 contextBridge.exposeInMainWorld('twc', {
-  load: () => ipcRenderer.invoke('data:load'), save: (data: unknown) => ipcRenderer.invoke('data:save', data), validateSettingsImport: (data: unknown) => ipcRenderer.invoke('data:save', data, true),
+  load: () => ipcRenderer.invoke('data:load'), save: (data: unknown, replaceDefaultPlaylist = false) => ipcRenderer.invoke('data:save', data, false, replaceDefaultPlaylist), validateSettingsImport: (data: unknown) => ipcRenderer.invoke('data:save', data, true),
+  setDefaultPlaylist: (playlistId: string) => ipcRenderer.invoke('spotify:set-default-playlist', playlistId),
   spotifyConnect: () => ipcRenderer.invoke('spotify:connect'), spotifyStatus: () => ipcRenderer.invoke('spotify:status'),
   spotifyDisconnect: () => ipcRenderer.invoke('spotify:disconnect'),
+  remoteInstaller: () => ipcRenderer.invoke('lan-remote:installer'),
+  lanRemoteStatus: () => ipcRenderer.invoke('lan-remote:status'),
+  revokeLanPairings: () => ipcRenderer.invoke('lan-remote:revoke-pairings'),
+  reportRandomAdvertisementTimes: (entries: [string, number][]) => ipcRenderer.invoke('lan-remote:random-advertisement-times', entries),
+  configureLanRemote: (enabled: boolean) => ipcRenderer.invoke('lan-remote:configure', enabled),
   onSpotifyHealth: (listener: (status: any) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, status: any) => listener(status);
     ipcRenderer.on('spotify:health', handler);
@@ -13,6 +19,15 @@ contextBridge.exposeInMainWorld('twc', {
   logsLoad: () => ipcRenderer.invoke('logs:load'), logsClear: () => ipcRenderer.invoke('logs:clear'),
   announcementsImport: () => ipcRenderer.invoke('announcements:import'), announcementsAudio: (id: string) => ipcRenderer.invoke('announcements:audio', id), announcementsDeleteFile: (id: string) => ipcRenderer.invoke('announcements:delete-file', id),
   announcementsStatus: () => ipcRenderer.invoke('announcements:status'),
+  audioActivity: () => ipcRenderer.invoke('audio:activity'),
+  setRendererAudioActivity: (kind: string, generation: number, active: boolean, resumeOnExit = false) =>
+    ipcRenderer.invoke('audio:renderer-activity', kind, generation, active, resumeOnExit),
+  resumeSpotifyAfterAudio: () => ipcRenderer.invoke('audio:resume-spotify'),
+  onAudioActivity: (listener: (status: any) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, status: any) => listener(status);
+    ipcRenderer.on('audio:activity', handler);
+    return () => ipcRenderer.removeListener('audio:activity', handler);
+  },
   onAnnouncementsStatus: (listener: (status: any) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, status: any) => listener(status);
     ipcRenderer.on('announcements:status', handler);

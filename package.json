@@ -10,9 +10,10 @@
     "build:electron": "tsc -p electron/tsconfig.json",
     "build": "tsc -b && vite --configLoader runner build && tsc -p electron/tsconfig.json",
     "preview": "vite preview",
-    "test": "tsc -p electron/tsconfig.json && node --test src/schedule.test.mjs",
-    "package:win": "npm run build && electron-builder --win nsis",
-    "release:win": "npm run build && electron-builder --win nsis --publish never"
+    "test": "tsc -p electron/tsconfig.json && node --test src/schedule.test.mjs remote-client.test.cjs",
+    "package:remote:win": "electron-builder --config remote-client/builder.cjs --win nsis --x64 --publish never",
+    "package:win": "npm run build && electron-builder --win nsis", 
+    "release": "node release.js"
   },
   "dependencies": {
     "electron-updater": "6.8.12",

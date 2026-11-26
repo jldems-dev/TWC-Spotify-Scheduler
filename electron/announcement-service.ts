@@ -28,6 +28,7 @@ function occursOn(schedule: any, date: Date) {
   if (anchor.getFullYear() !== year || anchor.getMonth() !== month - 1 || anchor.getDate() !== day) return false;
   return schedule.repeat === "yearly" ? date >= anchor && date.getMonth() === month - 1 && date.getDate() === day : localDateKey(date) === schedule.date;
 }
+export { occursOn as announcementOccursOn };
 function announcementEventsAt(schedules: any[], now: Date): AnnouncementOccurrence[] {
   const date = localDateKey(now), time = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
   return (schedules || []).filter(schedule => schedule.enabled && occursOn(schedule, now)).flatMap(schedule => {

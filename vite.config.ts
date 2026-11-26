@@ -1,8 +1,17 @@
 import { defineConfig } from 'vite';
+import { readFileSync } from 'node:fs';
 import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [
     react(),
+    {
+      name: 'lan-dashboard-theme',
+      apply: 'build',
+      generateBundle() {
+        const css = readFileSync(new URL('./src/style.css', import.meta.url), 'utf8');
+        this.emitFile({ type: 'asset', fileName: 'dashboard-theme.css', source: css.replaceAll('../assets/fonts/', '/fonts/') });
+      },
+    },
     {
       name: 'development-csp-websocket',
       transformIndexHtml(html, context) {

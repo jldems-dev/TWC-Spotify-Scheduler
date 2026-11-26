@@ -56,6 +56,7 @@ type SpotifyRequestOptions = {
   onUnauthorized?: () => Promise<void>;
   fetcher?: typeof fetch;
   timeoutMs?: number;
+  signal?: AbortSignal;
   onRetry?: (attempt: number, status?: number, retryAfter?: string | null) => void | Promise<void>;
   wait?: (milliseconds: number) => Promise<void>;
 };
@@ -64,16 +65,18 @@ type SpotifyRequestOptions = {
 export async function requestSpotifyApi(options: SpotifyRequestOptions): Promise<any | null> {
   const fetcher = options.fetcher || fetch;
   let accessToken = await options.getAccessToken();
-  const retryable = options.method === 'GET' || options.method === 'PUT';
+  // The caller manages retry timing when it supplies a polling deadline.
+  const retryable = !options.signal && (options.method === 'GET' || options.method === 'PUT');
   let transientAttempt = 0;
   for (let authAttempt = 0; authAttempt < 2;) {
+    options.signal?.throwIfAborted();
     let response: Response;
     try {
       response = await fetcher(`https://api.spotify.com/v1${options.endpoint}`, {
         method: options.method,
         headers: { Authorization: `Bearer ${accessToken}`, ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
         ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
-        signal: AbortSignal.timeout(options.timeoutMs || 15000),
+        signal: options.signal || AbortSignal.timeout(options.timeoutMs || 15000),
       });
     } catch (error: any) {
       const timeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';

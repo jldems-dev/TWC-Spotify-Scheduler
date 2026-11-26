@@ -6,6 +6,7 @@ node_modules/
 dist/
 dist-electron/
 release/
+release-remote/
 
 # Build caches
 .electron-builder-cache/

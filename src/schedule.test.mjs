@@ -4,12 +4,503 @@ import { access, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:f
 import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
+import { runInNewContext } from 'node:vm';
+import { createRequire } from 'node:module';
 import { schedulesConflict, validateSchedule, formatLocalDateTime, nextScheduledAction, scheduleBoundariesAt, activeQuietSchedules } from './schedule.mjs';
 import { ScheduleCoordinator, boundariesAt as schedulerBoundariesAt, boundariesBetween as schedulerBoundariesBetween, activeQuietSchedules as schedulerQuietSchedules } from '../dist-electron/scheduler.js';
 import { validateOAuthCallback, spotifyHttpError, readSpotifyResponse, requestSpotifyApi } from '../dist-electron/spotify-utils.js';
 import { captureQuietPlayback, quietRestorePlan } from '../dist-electron/quiet-state.js';
-import { activeDeviceId, playbackCommand, playlistPlaybackCommand, transferPlaybackCommand, shouldLaunchSpotifyDesktop } from '../dist-electron/spotify-playback.js';
-import { missingPlaybackScopes, sanitizeSpotifyDevices, startScheduledPlayback } from '../dist-electron/scheduled-playback.js';
+import { activeDeviceId, activePlaybackDeviceName, pauseSpotifyPlayback, playbackCommand, playlistPlaybackCommand, transferPlaybackCommand, shouldLaunchSpotifyDesktop } from '../dist-electron/spotify-playback.js';
+import { RendererAudioActivity } from '../dist-electron/active-audio.js';
+import { findLanNetwork, isLanPeer, LanRemote } from '../dist-electron/lan-remote.js';
+import { LanPairings } from '../dist-electron/lan-pairing.js';
+import { remotePlaybackBlock, remoteScheduleSummary } from '../dist-electron/lan-remote-dashboard.js';
+import { remotePage, remoteScript, remoteStyles } from '../dist-electron/lan-remote-page.js';
+import { defaultPlaylistSettings, missingPlaybackScopes, sanitizeSpotifyDevices, scheduledPlaylistUri, startScheduledPlayback } from '../dist-electron/scheduled-playback.js';
+
+it('keeps playback intact on save and uses the latest persisted default at each scheduled start', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-default-playlist-ipc-'));
+  const mainUrl = new URL('../dist-electron/main.js', import.meta.url);
+  const require = createRequire(mainUrl);
+  const mainSource = await readFile(mainUrl, 'utf8');
+  const [playlistA, playlistB, playlistC] = ['A', 'B', 'C'].map(letter => letter.repeat(22));
+  const uri = id => `spotify:playlist:${id}`;
+  let playback = { is_playing: true, context: { uri: uri(playlistA) } };
+  const commands = [];
+  const mockSpotifyRequest = async (method, endpoint, body) => {
+    if (method === 'GET' && endpoint === '/me/player') return playback;
+    if (method === 'GET' && endpoint === '/me/player/devices') return { devices: [{ id: 'desktop', is_active: true }] };
+    assert.equal(method, 'PUT');
+    assert.equal(endpoint, '/me/player/play?device_id=desktop');
+    commands.push(body.context_uri);
+    playback = { is_playing: true, context: { uri: body.context_uri } };
+  };
+  const startMain = () => {
+    const handlers = new Map();
+    const electron = {
+      app: {
+        getPath: () => dir,
+        getAppPath: () => dir,
+        getVersion: () => '1.0.0',
+        requestSingleInstanceLock: () => true,
+        whenReady: () => new Promise(() => {}),
+        on() {},
+      },
+      ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
+    };
+    const start = runInNewContext(`${mainSource}
+      spotifyRequest = mockSpotifyRequest;
+      verifyScheduledPlaybackScopes = async () => {};
+      executeScheduleBoundary;
+    `, {
+      exports: {},
+      require: name => {
+        if (name === 'electron') return electron;
+        if (name === './security-utils') return { ...require(name), isTrustedIpcRequest: () => true };
+        return require(name);
+      },
+      Buffer, process, structuredClone, mockSpotifyRequest,
+    });
+    return { invoke: (name, ...args) => handlers.get(name)({}, ...args), start };
+  };
+  const event = {
+    schedule: { name: 'Music schedule', playlistId: playlistA },
+    boundary: 'start',
+    overridePlaylistId: playlistA,
+  };
+  try {
+    const { invoke, start } = startMain();
+    const initial = await invoke('data:load');
+    initial.settings.schedulerEnabled = false;
+    await invoke('data:save', initial);
+    await assert.rejects(
+      invoke('data:save', { ...initial, settings: { ...initial.settings, defaultPlaylist: playlistB, defaultPlaylistUri: null } }),
+      /Invalid settings data/,
+    );
+    const selection = await invoke('spotify:set-default-playlist', playlistB);
+    assert.equal(selection.defaultPlaylistUri, uri(playlistB));
+    await invoke('data:save', initial); // An ordinary save still carries the pre-selection snapshot.
+    assert.equal(playback.context.uri, uri(playlistA));
+    assert.deepEqual(commands, []);
+    await start(event);
+    assert.deepEqual(commands, [uri(playlistB)]);
+    assert.equal(playback.context.uri, uri(playlistB));
+
+    const restarted = startMain();
+    const loaded = await restarted.invoke('data:load');
+    assert.equal(loaded.settings.defaultPlaylist, playlistB);
+    assert.equal(loaded.settings.defaultPlaylistUri, uri(playlistB));
+    assert.equal(loaded.settings.schedulerEnabled, false);
+    await restarted.invoke('spotify:set-default-playlist', playlistC);
+    assert.equal(playback.is_playing, true);
+    assert.equal(playback.context.uri, uri(playlistB));
+    assert.deepEqual(commands, [uri(playlistB)]);
+    await restarted.start(event);
+    assert.deepEqual(commands, [uri(playlistB), uri(playlistC)]);
+    assert.equal(playback.context.uri, uri(playlistC));
+
+    playback.is_playing = false;
+    await restarted.invoke('spotify:set-default-playlist', playlistA);
+    assert.equal(playback.is_playing, false);
+    assert.deepEqual(commands, [uri(playlistB), uri(playlistC)]);
+
+    await restarted.invoke('data:save', initial, false, true);
+    assert.equal((await restarted.invoke('data:load')).settings.defaultPlaylist, '');
+    assert.throws(() => invoke('spotify:set-default-playlist', 'Display name'), /Select a valid Spotify playlist/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+describe('LAN Spotify remote', () => {
+  it('loads the desktop dashboard without an access code and retries after going offline', async () => {
+    const nodes = new Map();
+    const element = id => {
+      if (!nodes.has(id)) nodes.set(id, { dataset: {}, addEventListener() {}, setAttribute() {} });
+      return nodes.get(id);
+    };
+    let refresh;
+    let available = true;
+    let requests = 0;
+    runInNewContext(remoteScript, {
+      location: { pathname: '/controller' },
+      document: { getElementById: element },
+      AbortSignal,
+      fetch: async (url, options) => {
+        requests++;
+        assert.equal(url, '/api/playback.getStatus');
+        assert.equal(options.headers.Authorization, undefined);
+        if (!available) throw new Error('Offline');
+        return { ok: true, json: async () => ({ status: { spotify: 'connected' } }) };
+      },
+      setInterval: callback => { refresh = callback; },
+    });
+    const drawn = () => new Promise(resolve => setImmediate(resolve));
+    await drawn();
+    assert.equal(element('dashboard').hidden, false);
+    assert.equal(element('pair').hidden, true);
+    assert.equal(element('disconnect').hidden, true);
+    available = false;
+    refresh();
+    await drawn();
+    assert.equal(element('connection').textContent, 'Disconnected');
+    available = true;
+    refresh();
+    await drawn();
+    assert.equal(element('connection').textContent, 'Online');
+    assert.equal(element('dashboard').hidden, false);
+    assert.equal(element('pair').hidden, true);
+    assert.equal(requests, 3);
+  });
+
+  it('restores pairing after PC 1 restarts, retains it offline, and rejects revoked or expired credentials', async t => {
+    if (!findLanNetwork()) return t.skip('No private IPv4 interface available');
+    const folder = await mkdtemp(path.join(os.tmpdir(), 'twc-lan-pairing-'));
+    const file = path.join(folder, 'pairings.json');
+    let now = Date.now();
+    let blocked = null;
+    let remote;
+    t.after(async () => { await remote?.close(); await rm(folder, { recursive: true, force: true }); });
+    async function start(pairings, port = 0) {
+      remote = new LanRemote({
+        pairings,
+        playback: async () => null,
+        blocked: () => blocked,
+        dashboard: async () => ({ spotify: 'connected', blocked }),
+        control: async () => null,
+      }, port);
+      await remote.configure(true);
+      assert.equal(remote.status().online, true, remote.status().error);
+    }
+    const call = (route, auth, method = 'GET') => fetch(remote.status().url + '/api/' + route, {
+      method, headers: { Authorization: auth },
+    });
+    let pairings = new LanPairings(() => file, () => now);
+    await start(pairings);
+    const access = 'Bearer ' + remote.status().accessCode;
+    assert.equal((await call('pairing.create', 'Bearer wrong', 'POST')).status, 401);
+    const response = await call('pairing.create', access, 'POST');
+    assert.equal(response.status, 201);
+    const { token } = await response.json();
+    const paired = 'Pairing ' + token;
+    assert.equal(token.length, 43);
+    assert.equal((await readFile(file, 'utf8')).includes(token), false);
+    assert.equal((await call('pairing.create', paired, 'POST')).status, 401);
+    assert.equal((await call('pairing.revoke', access, 'POST')).status, 401);
+    assert.equal((await call('playback.getStatus', paired)).status, 200);
+    assert.equal((await call('playback.previous', paired, 'POST')).status, 404);
+    blocked = 'Advertisement playing';
+    assert.equal((await call('playback.volume?percent=40', paired, 'POST')).status, 409);
+    const previousURL = remote.status().url;
+    await remote.close();
+    await assert.rejects(fetch(previousURL + '/api/playback.getStatus', { headers: { Authorization: paired } }));
+    pairings = new LanPairings(() => file, () => now);
+    await start(pairings, Number(new URL(previousURL).port));
+    assert.equal((await call('playback.getStatus', paired)).status, 200);
+    assert.equal((await call('playback.getStatus', access)).status, 401);
+
+    const beforeRevocation = 'Bearer ' + remote.status().accessCode;
+    remote.rotateAccessCode();
+    await pairings.revokeAll();
+    assert.equal((await call('playback.getStatus', paired)).status, 401);
+    assert.equal((await call('pairing.create', beforeRevocation, 'POST')).status, 401);
+    const authorized = 'Pairing ' + await pairings.issue();
+    assert.equal((await call('pairing.revoke', authorized, 'POST')).status, 204);
+    assert.equal((await call('playback.getStatus', authorized)).status, 401);
+    const expiring = 'Pairing ' + await pairings.issue();
+    now += 91 * 24 * 60 * 60 * 1000;
+    assert.equal((await call('playback.getStatus', expiring)).status, 401);
+  });
+
+  it('uses the desktop icon-button classes and leaves Previous track unavailable remotely', async () => {
+    const desktop = await readFile(new URL('./App.tsx', import.meta.url), 'utf8');
+    const controls = [...remotePage.matchAll(/id="(remote-(?:previous|play-toggle|next))" class="([^"]+)"/g)];
+    assert.deepEqual(controls.map(([, action, style]) => [action, style]), [
+      ['remote-previous', 'icon-btn'], ['remote-play-toggle', 'play-toggle'], ['remote-next', 'icon-btn'],
+    ]);
+    assert.match(desktop, /className="icon-btn"\s+aria-label="Previous track"[\s\S]+?className="play-toggle"[\s\S]+?className="icon-btn"\s+aria-label="Next track"/);
+    for (const icon of ['lucide-skip-back', 'lucide-play', 'lucide-pause', 'lucide-skip-forward'])
+      assert.ok(remotePage.includes(icon));
+    assert.match(remotePage, /id="remote-previous"[^>]+disabled>/);
+    assert.doesNotMatch(remotePage, /<(?:span|button)[^>]*>\s*(?:Play|Pause|Previous track|Next track)\s*</i);
+    assert.match(remotePage, /class="volume-control"[\s\S]+?lucide-volume2[\s\S]+?type="range" min="0" max="100"/);
+    assert.match(remoteStyles, /@media \(max-width: 700px\)[\s\S]+?\.remote-playback \{[^}]+grid-template-columns: minmax\(0, 1fr\)/);
+  });
+
+  it('renders authenticated remote data and locks browser controls during active audio', async () => {
+    const nodes = new Map();
+    const node = id => {
+      if (!nodes.has(id)) nodes.set(id, {
+        dataset: {},
+        setAttribute(name, value) { this[name] = value; },
+        addEventListener(event, callback) { this[event] = callback; },
+      });
+      return nodes.get(id);
+    };
+    const toggle = node('remote-play-toggle');
+    const next = node('remote-next');
+    const commands = [];
+    let refresh;
+    const status = {
+      spotify: 'connected', available: true, playing: true, track: 'Track', device: 'PC 2', deviceActive: true,
+      schedulerEnabled: true, defaultPlaylist: 'Default music', todayPlaylists: ['Today music'], supportsVolume: true, volume: 45,
+      timeZone: 'Asia/Manila', nextAction: { description: 'Pause Spotify', name: 'Morning', at: '2026-11-24T00:00:00.000Z' },
+    };
+    runInNewContext(remoteScript, {
+      document: { getElementById: node },
+      AbortSignal,
+      fetch: async (url, options) => {
+        if (options.method === 'POST') {
+          const [action, query] = url.split('.').at(-1).split('?');
+          commands.push(action);
+          if (action === 'volume') status.volume = Number(new URLSearchParams(query).get('percent'));
+          else if (action !== 'next') status.playing = action === 'play';
+        }
+        return { ok: true, json: async () => ({ status }) };
+      },
+      setInterval: callback => { refresh = callback; },
+    });
+    const drawn = () => new Promise(resolve => setImmediate(resolve));
+    assert.equal(node('dashboard').hidden, true);
+    node('code').value = 'access code';
+    node('pair').submit({ preventDefault() {} });
+    await drawn();
+    assert.equal(node('dashboard').hidden, false);
+    assert.equal(node('device').textContent, 'PC 2');
+    assert.equal(node('default-playlist').textContent, 'Default music');
+    assert.equal(node('today-playlist').textContent, 'Today music');
+    assert.match(node('schedule-action').textContent, /Pause Spotify/);
+    assert.match(node('schedule-time').textContent, /Asia\/Manila/);
+    assert.equal(toggle.disabled, false);
+    assert.equal(toggle['aria-label'], 'Pause');
+    assert.equal(node('remote-pause-icon').hidden, false);
+    status.advertisement = true;
+    status.blocked = 'Advertisement playing. Spotify controls are temporarily disabled.';
+    refresh();
+    await drawn();
+    assert.equal(node('advertisement').hidden, false);
+    assert.equal(node('playback-lock').textContent, status.blocked);
+    assert.equal(node('playback-lock').hidden, false);
+    assert.ok(toggle.disabled && next.disabled);
+    assert.equal(node('spotify-volume').disabled, true);
+    status.advertisement = false;
+    status.announcement = true;
+    status.blocked = 'Announcement playing. Spotify controls are temporarily disabled.';
+    refresh();
+    await drawn();
+    assert.ok(toggle.disabled && next.disabled);
+    status.announcement = false;
+    status.blocked = null;
+    refresh();
+    await drawn();
+    assert.equal(node('playback-lock').hidden, true);
+    for (const [button, label] of [[toggle, 'Pause'], [toggle, 'Play'], [next, undefined]]) {
+      assert.equal(button.disabled, false);
+      if (label) assert.equal(toggle['aria-label'], label);
+      button.click();
+      await drawn();
+    }
+    assert.equal(node('remote-previous').click, undefined);
+    assert.deepEqual(commands, ['pause', 'play', 'next']);
+    const slider = node('spotify-volume');
+    assert.equal(slider.disabled, false);
+    assert.equal(slider.value, '45');
+    for (const [value, event] of [['70', 'pointerup'], ['25', 'keyup']]) {
+      slider.value = value;
+      slider.input();
+      slider[event]();
+      await drawn();
+      assert.equal(node('spotify-volume-value').textContent, value + '%');
+    }
+    assert.deepEqual(commands.slice(-2), ['volume', 'volume']);
+    status.volume = 0;
+    refresh();
+    await drawn();
+    assert.equal(slider.value, '0');
+    assert.equal(node('spotify-volume-value').textContent, '0%');
+    node('disconnect').click();
+    assert.equal(node('dashboard').hidden, true);
+  });
+
+  it('projects scheduled boundaries and playlist exceptions in PC 1 local time', () => {
+    const now = new Date(2026, 10, 24, 10, 0);
+    const store = {
+      settings: { schedulerEnabled: true, defaultPlaylist: 'default' },
+      schedules: [
+        { id: 'start', name: 'Morning music', enabled: true, days: ['Tue'], start: '09:00', end: '11:00', playlistId: 'default' },
+        { id: 'skip', name: 'Afternoon music', enabled: true, days: ['Tue'], start: '13:00', end: '15:00', playlistId: 'skip' },
+      ],
+      exceptions: [
+        { date: '2026-11-24', scheduleId: 'start', type: 'replace', playlistId: 'replacement' },
+        { date: '2026-11-24', scheduleId: 'skip', type: 'skip' },
+      ],
+      playlists: [{ id: 'default', name: 'Default music' }, { id: 'replacement', name: 'Special music' }, { id: 'skip', name: 'Skipped music' }],
+      announcements: [{ id: 'announcement', enabled: true }],
+      announcementSchedules: [
+        { name: 'Store announcement', enabled: true, date: '2026-11-24', time: '10:15', announcementId: 'announcement' },
+      ],
+      advertisements: [{ id: 'advertisement', enabled: true }],
+      advertisementSchedules: [
+        { id: 'random', type: 'random', name: 'Store advertisement', enabled: true, days: ['Tue'], start: '09:00', end: '11:00', advertisementIds: ['advertisement'] },
+      ],
+    };
+    const summary = remoteScheduleSummary(store, now);
+    assert.deepEqual(summary.nextAction, { description: 'Announcement', name: 'Store announcement', at: new Date(2026, 10, 24, 10, 15).toISOString() });
+    assert.equal(summary.defaultPlaylist, 'Default music');
+    assert.deepEqual(summary.todayPlaylists, ['Default music']);
+    assert.deepEqual(remoteScheduleSummary({ ...store, settings: { schedulerEnabled: true } }, now).todayPlaylists, ['Special music']);
+    assert.equal(remoteScheduleSummary(store, now, new Map([['random', new Date(2026, 10, 24, 10, 10).getTime()]])).nextAction.description, 'Advertisement');
+    store.announcementSchedules = [];
+    assert.equal(remoteScheduleSummary(store, now).nextAction.description, 'Pause Spotify');
+    store.settings.defaultPlaylist = 'replacement';
+    store.exceptions = [];
+    const changed = remoteScheduleSummary(store, now);
+    assert.equal(changed.defaultPlaylist, 'Special music');
+    assert.deepEqual(changed.todayPlaylists, ['Special music']);
+    assert.match(remotePlaybackBlock({ announcement: true, advertisement: true, blocked: true }, false), /Announcement and advertisement/);
+  });
+
+  it('only allows private peers on the listening interface subnet', () => {
+    const network = { address: '192.168.1.10', netmask: '255.255.255.0' };
+    assert.equal(isLanPeer('192.168.1.20', network), true);
+    assert.equal(isLanPeer('192.168.2.20', network), false);
+    assert.equal(isLanPeer('127.0.0.1', network), false);
+    assert.equal(isLanPeer('8.8.8.8', network), false);
+  });
+
+  it('prefers Ethernet on a multihomed server and accepts Wi-Fi clients on its subnet', () => {
+    const ipv4 = (address, internal = false) => ({ address, internal, family: 'IPv4', netmask: '255.255.255.0' });
+    const wired = ipv4('192.168.1.10');
+    const network = findLanNetwork({
+      'vEthernet (Default Switch)': [ipv4('172.16.1.4')],
+      'Wi-Fi': [ipv4('192.168.2.5')],
+      Ethernet: [wired],
+      Loopback: [ipv4('127.0.0.1', true)],
+    });
+    assert.equal(network, wired);
+    assert.equal(isLanPeer('192.168.1.42', network), true);
+  });
+
+  it('serves the restricted browser remote and revokes access when disabled', async t => {
+    if (!findLanNetwork()) return t.skip('No private IPv4 interface available');
+    const commands = [];
+    let blocked = null;
+    let playing = false;
+    let volume = 45;
+    let playbackReads = 0;
+    const dashboard = {
+      spotify: 'connected', announcement: false, advertisement: false, schedulerEnabled: true, quiet: false,
+      timeZone: 'Asia/Manila', nextAction: { description: 'Start Spotify', name: 'Morning', at: '2026-11-24T00:00:00.000Z' },
+      defaultPlaylist: 'Default music', todayPlaylists: ['Special music'],
+    };
+    const playback = () => ({
+      is_playing: playing,
+      activeDeviceName: 'PC 2',
+      device: { is_usable: true, supports_volume: true, volume_percent: volume, name: 'PC 2', id: 'private-device-id' },
+      item: { name: 'Track', artists: [{ name: 'Artist' }] },
+      refresh_token: 'private-test-value',
+    });
+    const remote = new LanRemote({
+      theme: { stylesheet: path.resolve('src/style.css'), assetDirectory: path.resolve('assets') },
+      brandLogo: async () => ({ bytes: Buffer.from('test logo bytes'), mime: 'image/png' }),
+      playback: async () => { playbackReads++; return playback(); },
+      blocked: () => blocked,
+      dashboard: async () => ({ ...dashboard, blocked, privateSetting: 'not public' }),
+      control: async (action, value) => {
+        commands.push(action);
+        if (action === 'volume') volume = value;
+        else if (action !== 'next') playing = action === 'play';
+        return playback();
+      },
+    }, 0);
+    t.after(() => remote.close());
+    assert.equal(remote.status().enabled, false);
+    await remote.configure(true);
+    const { online, url, accessCode } = remote.status();
+    assert.equal(online, true, remote.status().error);
+    assert.equal(accessCode.length, 43);
+    const request = (route, options = {}) => fetch(url + route, options);
+    const headers = { Authorization: 'Bearer ' + accessCode };
+    const getStatus = () => request('/api/playback.getStatus', { headers });
+    const command = (action, opts = {}) => request('/api/playback.' + action, { method: 'POST', headers, ...opts });
+
+    const page = await request('/');
+    assert.equal(page.status, 200);
+    const html = await page.text();
+    for (const heading of ['Current Status', 'Playback Device', 'Next Schedule Action', 'Default Playlist', "Today's Playlist"])
+      assert.ok(html.includes(heading));
+    assert.match(page.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+    assert.match(html, /class="status-card"/);
+    assert.match(html, /class="playlist-row"/);
+    const theme = await request('/dashboard-theme.css');
+    assert.equal(theme.status, 200);
+    assert.match(await theme.text(), /url\("\/fonts\/Poppins-Regular\.ttf"\)/);
+    assert.equal((await request('/fonts/Poppins-Regular.ttf')).headers.get('content-type'), 'font/ttf');
+    assert.equal((await request('/branding/twc-stafford-logo.png')).status, 200);
+    assert.equal((await request('/brand-logo')).status, 401);
+    assert.equal((await request('/brand-logo', { headers })).headers.get('content-type'), 'image/png');
+    assert.equal((await request('/index.html')).status, 404);
+    assert.equal((await request('/remote.js')).status, 200);
+    assert.equal((await request('/api/playback.getStatus')).status, 401);
+    assert.equal((await command('play', { headers: { Authorization: 'Bearer invalid' } })).status, 401);
+    assert.equal((await command('play', { headers: { ...headers, Origin: 'http://example.com' } })).status, 403);
+    assert.equal((await command('play', { headers: { ...headers, 'X-Forwarded-For': '8.8.8.8' } })).status, 403);
+    assert.equal((await command('play', { body: 'unexpected' })).status, 400);
+    assert.equal((await command('previous')).status, 404);
+    assert.equal((await request('/api/settings', { headers })).status, 404);
+    assert.equal((await request('/api/schedules', { method: 'POST', headers })).status, 404);
+    assert.equal((await request('/api/playlists', { method: 'POST', headers })).status, 404);
+    assert.deepEqual(await (await getStatus()).json(), { status: { ...dashboard, available: true, playing: false, track: 'Track — Artist', device: 'PC 2', deviceActive: true, volume: 45, supportsVolume: true, blocked: null } });
+    dashboard.todayPlaylists = ['Updated playlist'];
+    dashboard.nextAction.description = 'Announcement';
+    const updated = (await (await getStatus()).json()).status;
+    assert.deepEqual(updated.todayPlaylists, ['Updated playlist']);
+    assert.equal(updated.nextAction.description, 'Announcement');
+    assert.equal(playbackReads, 1);
+    assert.deepEqual(commands, []);
+
+    assert.equal((await command('play')).status, 200);
+    assert.equal((await command('next')).status, 200);
+    for (const reason of ['Announcement playing', 'Advertisement playing', 'Quiet Hours']) {
+      blocked = reason;
+      dashboard.announcement = reason === 'Announcement playing';
+      dashboard.advertisement = reason === 'Advertisement playing';
+      const status = (await (await getStatus()).json()).status;
+      assert.equal(status.blocked, reason);
+      assert.equal(status.announcement, dashboard.announcement);
+      assert.equal(status.advertisement, dashboard.advertisement);
+      assert.equal((await command('pause')).status, 409);
+      assert.equal((await command('volume?percent=40')).status, 409);
+    }
+    blocked = null;
+    assert.equal((await command('pause')).status, 200);
+    assert.deepEqual(commands, ['play', 'next', 'pause']);
+    assert.equal((await command('volume?percent=101')).status, 400);
+    assert.equal((await command('volume?percent=8.5')).status, 400);
+    assert.equal((await command('volume?percent=40', { headers: {} })).status, 401);
+    for (const percent of [100, 0]) {
+      const response = await command('volume?percent=' + percent);
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).status.volume, percent);
+      assert.equal(volume, percent);
+    }
+    volume = 30;
+    remote.updatePlayback(playback());
+    assert.equal((await (await getStatus()).json()).status.volume, 30);
+
+    let limited = false;
+    for (let count = 0; count < 65 && !limited; count++)
+      limited = (await request('/api/playback.getStatus')).status === 429;
+    assert.equal(limited, true);
+    await remote.configure(false);
+    assert.equal(remote.status().online, false);
+    await assert.rejects(request('/'));
+    await remote.configure(true);
+    assert.equal(remote.status().online, true);
+    assert.notEqual(remote.status().accessCode, accessCode);
+    const revoked = await fetch(remote.status().url + '/api/playback.getStatus', { headers });
+    assert.equal(revoked.status, 401);
+    assert.deepEqual(commands, ['play', 'next', 'pause', 'volume', 'volume']);
+  });
+});
 import { announcementEventsAt, unexpiredAnnouncementEvents, announcementWindowActive, validateAnnouncementSchedule, saveAnnouncementSchedule, removeAnnouncementSchedule, setAnnouncementScheduleEnabled, upcomingAnnouncementOccurrences } from './announcement-scheduler.mjs';
 import { validateAdvertisementSchedule, normalizeAdvertisementSchedule, saveAdvertisementSchedule, removeAdvertisementSchedule, setAdvertisementScheduleEnabled } from '../dist-electron/advertisement-schedule.js';
 import { AnnouncementService } from '../dist-electron/announcement-service.js';
@@ -796,6 +1287,58 @@ describe('scheduler missed-event and crash recovery', () => {
     getSchedules: async () => ({ settings: { schedulerEnabled: true, missedSchedulePolicy: 'skip' }, schedules, ...extras }),
     execute: async () => {}, recoverQuiet: async () => {}, enforceQuiet: async () => false, log: async () => {}, wait: async () => {},
   });
+  it('loads the saved default after restart and uses a newly saved URI at the next scheduled start', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'twc-default-playlist-'));
+    const settingsFile = path.join(dir, 'settings.json');
+    const [playlistA, playlistB, override] = ['A', 'B', 'C'].map(letter => letter.repeat(22));
+    const uri = id => `spotify:playlist:${id}`;
+    const save = id => writeFile(settingsFile, JSON.stringify(defaultPlaylistSettings(id, uri(id))));
+    const load = async () => JSON.parse(await readFile(settingsFile, 'utf8'));
+    const schedules = [
+      { ...s('first', ['Fri'], '12:00', '12:01'), playlistId: playlistA },
+      { ...s('next', ['Fri'], '12:02', '13:00'), playlistId: playlistA },
+    ];
+    const commands = [];
+    let playing = null;
+    let ended;
+    const coordinator = now => new ScheduleCoordinator({
+      ...optsFor(dir, now, schedules),
+      execute: async event => {
+        if (event.boundary === 'end') {
+          ended = event.startedPlaylistUri;
+          return;
+        }
+        const playlistUri = scheduledPlaylistUri(await load(), event.schedule.playlistId, event.overridePlaylistId);
+        await startScheduledPlayback({
+          playlistId: playlistUri,
+          getPlayback: async () => playing,
+          getDevices: async () => [{ id: 'desktop', is_active: true }],
+          transfer: async () => assert.fail('Active device should be reused'),
+          play: async (deviceId, context) => {
+            const command = playlistPlaybackCommand(context, deviceId);
+            commands.push(command.body.context_uri);
+            playing = { is_playing: true, context: { uri: command.body.context_uri } };
+          },
+        });
+        return { playlistUri };
+      },
+    });
+    try {
+      await save(playlistA);
+      assert.deepEqual(await load(), { defaultPlaylist: playlistA, defaultPlaylistUri: uri(playlistA) });
+      await coordinator(at(12, 0)).tick('startup');
+      await save(playlistB);
+      assert.deepEqual(commands, [uri(playlistA)]);
+      await coordinator(at(12, 1)).tick('startup');
+      assert.equal(ended, uri(playlistA));
+      await coordinator(at(12, 2)).tick('startup');
+      assert.deepEqual(commands, [uri(playlistA), uri(playlistB)]);
+      assert.equal(scheduledPlaylistUri(await load(), playlistA, override), uri(playlistB));
+      assert.equal(scheduledPlaylistUri({}, playlistA, override), uri(override));
+      assert.equal(scheduledPlaylistUri({ defaultPlaylist: playlistA }, playlistB), uri(playlistA));
+      assert.equal(scheduledPlaylistUri({}, playlistA), uri(playlistA));
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
   it('enumerates missed local-time boundaries including overnight ends', () => {
     const overnight = { ...s('overnight-recovery', ['Fri'], '23:00', '01:00'), quiet: true };
     const events = schedulerBoundariesBetween([overnight], at(23, 59), new Date(2026, 9, 24, 1, 1));
@@ -995,6 +1538,76 @@ describe('quiet-hour playback restoration', () => {
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
 });
+describe('Spotify Pause verification', () => {
+  const playback = (id, is_playing) => ({ device: { id }, is_playing });
+  const verify = (id, states, overrides = {}) => {
+    const events = [];
+    let index = 0;
+    const result = pauseSpotifyPlayback(id, {
+      pause: async target => { events.push(['pause', target]); return null; },
+      onAccepted: () => events.push('accepted'),
+      getPlayback: async () => {
+        events.push('read');
+        return states[Math.min(index++, states.length - 1)];
+      },
+      getDevices: async () => { events.push('devices'); return [{ id }]; },
+      intervalMs: 5,
+      timeoutMs: 150,
+      ...overrides,
+    });
+    return { result, events };
+  };
+
+  it('confirms a local pause after Spotify accepts it with an empty response', async () => {
+    const paused = playback('local', false);
+    const { result, events } = verify('local', [paused]);
+    assert.equal(await result, paused);
+    assert.deepEqual(events, [['pause', 'local'], 'accepted', 'read']);
+  });
+
+  it('waits for a delayed remote pause and ignores a paused state from PC 1', async () => {
+    const paused = playback('remote', false);
+    const { result, events } = verify('remote', [playback('remote', true), playback('local', false), playback('remote', true), paused]);
+    assert.equal(await result, paused);
+    assert.deepEqual(events, [['pause', 'remote'], 'accepted', 'read', 'read', 'read', 'read']);
+  });
+
+  it('checks availability once when the selected device disappears', async () => {
+    let deviceReads = 0;
+    const { result } = verify('remote', [null], {
+      getDevices: async () => { deviceReads++; return [{ id: 'local' }]; },
+    });
+    await assert.rejects(result, /selected playback device became unavailable/);
+    assert.equal(deviceReads, 1);
+  });
+
+  it('reports a device switch when playback stays on another device', async () => {
+    await assert.rejects(verify('remote', [playback('local', false)]).result, /playback moved to another device/);
+  });
+
+  it('reports playback still active after polling without a device-list request', async () => {
+    const { result, events } = verify('remote', [playback('remote', true)]);
+    await assert.rejects(result, /still active.*timed out/);
+    assert.ok(events.filter(event => event === 'read').length > 1);
+    assert.equal(events.includes('devices'), false);
+  });
+
+  it('distinguishes command rejection, an unavailable target, and connection loss', async () => {
+    for (const [error, expected] of [
+      ['Spotify denied the operation (403)', /Spotify rejected Pause/],
+      ['Spotify could not find the device (404)', /device is unavailable/],
+    ]) {
+      const { result, events } = verify('remote', [], { pause: async () => { throw new Error(error); } });
+      await assert.rejects(result, expected);
+      assert.deepEqual(events, []);
+    }
+    const { result } = verify('remote', [], {
+      getPlayback: async () => { throw new Error('Spotify network request failed'); },
+    });
+    await assert.rejects(result, /accepted Pause.*connection was lost/);
+  });
+});
+
 describe('Spotify authorization and API errors', () => {
   it('classifies authentication, network, missing device, and playback failures separately', () => {
     assert.equal(classifySpotifyHealth({ authenticated: false }).state, 'disconnected');
@@ -1198,6 +1811,45 @@ describe('Spotify authorization and API errors', () => {
     assert.equal(activeDeviceId(null, [{ id: 'inactive', is_active: false }]), null);
     assert.equal(activeDeviceId(null, [{ id: 'active', is_active: true }]), 'active');
     assert.equal(activeDeviceId(null, [{ id: 'restricted', is_active: true, is_restricted: true }]), null);
+  });
+
+  it('displays the active Spotify device independently of the controllable device', () => {
+    const remote = { name: 'STA-OTC-001', is_active: true, is_restricted: true };
+    const inactive = { name: 'Another Spotify device', is_active: false };
+    assert.equal(activePlaybackDeviceName({ device: remote, is_playing: true }, [inactive]), remote.name);
+    assert.equal(activePlaybackDeviceName(null, [inactive, remote]), remote.name);
+    assert.equal(activePlaybackDeviceName(null, [inactive]), null);
+  });
+
+  it('keeps controls blocked until both audio types finish, in either order', () => {
+    for (const [first, second] of [['announcement', 'advertisement'], ['advertisement', 'announcement']]) {
+      const audio = new RendererAudioActivity();
+      assert.deepEqual(audio.status(), { announcement: false, advertisement: false, blocked: false });
+      audio.start(first, 1);
+      assert.equal(audio.status()[first], true);
+      assert.equal(audio.status().blocked, true);
+      audio.start(second, 1);
+      assert.deepEqual(audio.status(), { announcement: true, advertisement: true, blocked: true });
+      audio.finish(first, 1);
+      assert.equal(audio.status()[first], false);
+      assert.equal(audio.status()[second], true);
+      assert.equal(audio.status().blocked, true);
+      audio.finish(second, 1);
+      assert.equal(audio.status().blocked, false);
+    }
+  });
+
+  it('ignores stale cancellations and preserves scheduled announcement status across renderer reloads', () => {
+    const audio = new RendererAudioActivity();
+    const scheduled = { active: 'scheduled-announcement', windowActive: false };
+    audio.start('advertisement', 1);
+    audio.start('advertisement', 2, true);
+    audio.finish('advertisement', 1);
+    assert.deepEqual(audio.status(scheduled), { announcement: true, advertisement: true, blocked: true });
+    assert.equal(audio.clear(), true);
+    assert.deepEqual(audio.status(scheduled), { announcement: true, advertisement: false, blocked: true });
+    assert.equal(audio.status().blocked, false);
+    assert.deepEqual(audio.status({ active: null, windowActive: true }), { announcement: false, advertisement: false, blocked: true });
   });
   it('accepts a one-time local callback with the matching state', () => {
     assert.deepEqual(validateOAuthCallback('http://127.0.0.1:43821/callback?code=abc&state=xyz', 'http://127.0.0.1:43821/callback', 'xyz'), { code: 'abc' });
